@@ -708,6 +708,301 @@ local function toggle_diff(kind)
   vim.api.nvim_set_current_win(M.code_win)
 end
 
+-- Revert ------------------------------------------------------------------------
+-- R puts back what the file held before the agent's session: the change under
+-- the cursor (code or diff window), or whole files (list, also on a visual
+-- selection of rows). Every revert first saves what it replaces in
+-- reverted/<id>/, and :AgentEditsUndoRevert puts the last one back.
+
+local reverted_dir = state_dir .. "/reverted"
+local REVERT_KEEP = 7 * 86400
+
+-- Asks before a revert changes files. Tests replace it.
+function M.confirm(question)
+  local answer = vim.fn.confirm(question, "&Yes\n&No", 2)
+  vim.cmd("redraw")
+  return answer == 1
+end
+
+local function warn(msg) vim.notify("agent-edits: " .. msg, vim.log.levels.WARN) end
+
+local function read_raw(path)
+  local fh = io.open(path, "rb")
+  if not fh then return nil end
+  local text = fh:read("*a")
+  fh:close()
+  return text
+end
+
+-- Writes through a temporary file and a rename, so the agent never reads a
+-- half-written file. Keeps the file's permissions.
+local function write_raw(path, text)
+  local dir = vim.fn.fnamemodify(path, ":h")
+  vim.fn.mkdir(dir, "p")
+  local st = vim.uv.fs_stat(path)
+  local tmp = dir .. "/.agent-edits-revert-" .. vim.fn.fnamemodify(path, ":t")
+  local fh, err = io.open(tmp, "wb")
+  if not fh then return nil, err end
+  fh:write(text)
+  fh:close()
+  -- The type bits sit above 4096; what is left is the permissions.
+  if st then vim.uv.fs_chmod(tmp, st.mode % 4096) end
+  local ok, rename_err = vim.uv.fs_rename(tmp, path)
+  if not ok then
+    os.remove(tmp)
+    return nil, rename_err
+  end
+  return true
+end
+
+-- Size and mtime: how a file looked right after a revert ("absent" if gone).
+local function stamp(path)
+  local st = vim.uv.fs_stat(path)
+  return st and string.format("%d.%d.%d", st.mtime.sec, st.mtime.nsec, st.size) or "absent"
+end
+
+-- What a revert of `e` puts back: { kind = "file", text = ... }, or
+-- { kind = "new" } for a file the session created. Nil and a reason when the
+-- session's starting point is unknown.
+local function revert_base(e)
+  local base = baseline_file(e)
+  if base then
+    if vim.uv.fs_stat(base) then return { kind = "file", text = read_raw(base) or "" } end
+    if vim.uv.fs_stat(base .. ".new") then return { kind = "new" } end
+    if vim.uv.fs_stat(base .. ".skip") then
+      return nil, e.rel .. " was over 2 MB, so no snapshot was kept"
+    end
+  end
+  return nil, "no snapshot of " .. e.rel .. " before the agent's session (shell edit or older entry)"
+end
+
+-- Saves what `paths` hold now in a new reverted/<id>/, and returns the
+-- function that completes the record once the files are written:
+-- index.tsv holds "<path>\t<saved copy or absent>\t<stamp after the revert>".
+local function start_undo(paths)
+  if vim.uv.fs_stat(reverted_dir) then
+    local cutoff = os.time() - REVERT_KEEP
+    for name in vim.fs.dir(reverted_dir) do
+      if (tonumber(name:sub(1, 10)) or 0) < cutoff then vim.fn.delete(reverted_dir .. "/" .. name, "rf") end
+    end
+  end
+  local sec, usec = vim.uv.gettimeofday()
+  local dir = string.format("%s/%d%06d", reverted_dir, sec, usec)
+  vim.fn.mkdir(dir, "p")
+  local saved = {}
+  for i, path in ipairs(paths) do
+    local text = read_raw(path)
+    if text then
+      local fh = assert(io.open(dir .. "/" .. i, "wb"))
+      fh:write(text)
+      fh:close()
+    end
+    saved[i] = text and tostring(i) or "absent"
+  end
+  return function()
+    local index = {}
+    for i, path in ipairs(paths) do
+      index[i] = table.concat({ path, saved[i], stamp(path) }, "\t")
+    end
+    vim.fn.writefile(index, dir .. "/index.tsv")
+  end
+end
+
+-- After files changed under the viewer: reload the previewed one and the list.
+local function after_change(paths)
+  diff_off()
+  local e = selected()
+  if e and vim.tbl_contains(paths, e.path) and vim.api.nvim_win_is_valid(M.code_win) then
+    vim.api.nvim_win_call(M.code_win, function()
+      vim.cmd("silent! edit!")
+      vim.bo.modifiable = false
+    end)
+  end
+  refresh(true)
+  e = selected()
+  if e then
+    M.update_markers(e)
+    set_code_winbar(e)
+  end
+end
+
+-- Lines of a text, and whether it ends with a newline.
+local function split_lines(text)
+  if text == "" then return {}, false end
+  local eol = text:sub(-1) == "\n"
+  if eol then text = text:sub(1, -2) end
+  return vim.split(text, "\n", { plain = true }), eol
+end
+
+local function join_lines(lines, eol)
+  if #lines == 0 then return "" end
+  return table.concat(lines, "\n") .. (eol and "\n" or "")
+end
+
+-- R in the code window (or the diff window): the change under the cursor.
+local function revert_hunk()
+  local e = selected()
+  if not e then return end
+  local win = vim.api.nvim_get_current_win()
+  local in_diff = win == M.diff_win
+  local base, why = revert_base(e)
+  if not base then return warn(why) end
+  local current = read_raw(e.path)
+  if not current then return warn("the file was deleted: R in the list restores it") end
+  local old = base.text or ""
+  if old:find("\0", 1, true) or current:find("\0", 1, true) then
+    return warn("binary file: R in the list reverts the whole file")
+  end
+  local a = split_lines(old)
+  local b, eol = split_lines(current)
+  -- The cursor must point at the lines on disk: the buffer has to be up to date.
+  local shown = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(M.code_win), 0, -1, false)
+  if not vim.deep_equal(shown, #b == 0 and { "" } or b) then
+    vim.cmd("silent! checktime")
+    return warn("the file changed, try again")
+  end
+  local ok, hunks = pcall(diff_fn, join_lines(a, true), join_lines(b, true), { result_type = "indices" })
+  if not ok or type(hunks) ~= "table" then return warn("could not compare the file") end
+
+  -- In the code window the cursor is on the new lines; in the diff window on
+  -- the old ones. A count of 0 means "after line start": its marker is there.
+  local line = vim.api.nvim_win_get_cursor(win)[1]
+  local pick
+  for _, h in ipairs(hunks) do
+    local start, count = h[3], h[4]
+    if in_diff then start, count = h[1], h[2] end
+    if count > 0 and line >= start and line < start + count then
+      pick = h
+      break
+    end
+    if count == 0 and math.max(start, 1) == line then pick = pick or h end
+  end
+  if not pick then return warn("no change under the cursor") end
+  if not M.confirm(string.format("Revert this change in %s?", e.rel)) then return end
+
+  local start_a, count_a, start_b, count_b = unpack(pick)
+  if count_b == 0 then start_b = start_b + 1 end
+  local out = {}
+  for i = 1, start_b - 1 do out[#out + 1] = b[i] end
+  for i = start_a, start_a + count_a - 1 do out[#out + 1] = a[i] end
+  for i = start_b + count_b, #b do out[#out + 1] = b[i] end
+  if #b == 0 then eol = old:sub(-1) == "\n" end
+
+  local finish = start_undo({ e.path })
+  local written, err = write_raw(e.path, join_lines(out, eol))
+  if not written then return warn("could not write " .. e.rel .. ": " .. tostring(err)) end
+  finish()
+  after_change({ e.path })
+  vim.notify("agent-edits: reverted the change (:AgentEditsUndoRevert puts it back)")
+end
+
+-- R in the list: whole files back to before their session. A file the session
+-- created is deleted, a deleted one is written back. The files count as
+-- reviewed: the reviewer just decided on them.
+local function revert_files(first, last)
+  local todo, skipped, seen = {}, {}, {}
+  for row = first, last do
+    local r = M.rows[row]
+    if r and r.entry and not seen[r.entry.path] then
+      seen[r.entry.path] = true
+      local base, why = revert_base(r.entry)
+      if base then
+        todo[#todo + 1] = { e = r.entry, base = base }
+      else
+        skipped[#skipped + 1] = why
+      end
+    end
+  end
+  if #todo == 0 then
+    if #skipped > 0 then warn(table.concat(skipped, "; ")) end
+    return
+  end
+  local question
+  if #todo == 1 then
+    local t = todo[1]
+    question = string.format("Revert %s to before %s's session?%s", t.e.rel, t.e.agent,
+      t.base.kind == "new" and " The session created it: it will be deleted." or "")
+  else
+    question = string.format("Revert %d files to before their agent's session?", #todo)
+  end
+  if #skipped > 0 then question = question .. "\n(skipped: " .. table.concat(skipped, "; ") .. ")" end
+  if not M.confirm(question) then return end
+
+  local paths = {}
+  for _, t in ipairs(todo) do paths[#paths + 1] = t.e.path end
+  local finish = start_undo(paths)
+  local failed = {}
+  for _, t in ipairs(todo) do
+    if t.base.kind == "new" then
+      if vim.uv.fs_stat(t.e.path) and not os.remove(t.e.path) then failed[#failed + 1] = t.e.rel end
+    elseif not write_raw(t.e.path, t.base.text) then
+      failed[#failed + 1] = t.e.rel
+    end
+  end
+  finish()
+  local ts = 0
+  for _, e in ipairs(M.all or {}) do
+    if seen[e.path] then ts = math.max(ts, e.ts) end
+  end
+  vim.fn.system(vim.list_extend({ log_cmd, "--reviewed", tostring(ts) }, paths))
+  after_change(paths)
+  if #failed > 0 then
+    warn("could not revert " .. table.concat(failed, ", "))
+  else
+    vim.notify(string.format("agent-edits: reverted %d file%s (:AgentEditsUndoRevert puts %s back)",
+      #todo, #todo == 1 and "" or "s", #todo == 1 and "it" or "them"))
+  end
+end
+
+local function revert_here()
+  if vim.api.nvim_get_current_win() == M.list_win then
+    local row = vim.api.nvim_win_get_cursor(M.list_win)[1]
+    revert_files(row, row)
+  else
+    revert_hunk()
+  end
+end
+
+-- Puts back what the last revert replaced. Refuses when a file changed since
+-- the revert (the agent may have edited it again), unless `force`.
+local function undo_revert(force)
+  local ids = {}
+  if vim.uv.fs_stat(reverted_dir) then
+    for name, kind in vim.fs.dir(reverted_dir) do
+      if kind == "directory" and vim.uv.fs_stat(reverted_dir .. "/" .. name .. "/index.tsv") then
+        ids[#ids + 1] = name
+      end
+    end
+  end
+  table.sort(ids)
+  if #ids == 0 then
+    vim.notify("agent-edits: nothing to undo")
+    return
+  end
+  local dir = reverted_dir .. "/" .. ids[#ids]
+  local rows, changed, paths = {}, {}, {}
+  for _, l in ipairs(vim.fn.readfile(dir .. "/index.tsv")) do
+    local path, saved, after = unpack(vim.split(l, "\t", { plain = true }))
+    rows[#rows + 1] = { path = path, saved = saved }
+    paths[#paths + 1] = path
+    if stamp(path) ~= after then changed[#changed + 1] = vim.fn.fnamemodify(path, ":~:.") end
+  end
+  if #changed > 0 and not force then
+    return warn("changed since the revert: " .. table.concat(changed, ", ")
+      .. ". :AgentEditsUndoRevert! puts the old content back anyway")
+  end
+  for _, r in ipairs(rows) do
+    if r.saved == "absent" then
+      os.remove(r.path)
+    else
+      write_raw(r.path, read_raw(dir .. "/" .. r.saved) or "")
+    end
+  end
+  vim.fn.delete(dir, "rf")
+  after_change(paths)
+  vim.notify(string.format("agent-edits: undid the revert of %d file%s", #rows, #rows == 1 and "" or "s"))
+end
+
 local function inner_option(name)
   local out = vim.fn.system({ "tmux", "show-options", "-qv", name })
   return vim.v.shell_error == 0 and vim.trim(out) or ""
@@ -1009,6 +1304,9 @@ local HELP = {
   "   ]c / [c           next / previous change (signs in the margin)",
   "   o                 open in $EDITOR, new tmux window, at this line",
   "   O                 same, in a split next to the agent",
+  "   R                 revert to before the agent's session: in the code,",
+  "                     the change under the cursor; in the list, the whole",
+  "                     file (also on a visual selection of rows)",
   "   Ctrl-z            hide the popup (prefix + e brings it back)",
   "   :q  ZZ  ZQ        quit the viewer",
   "",
@@ -1020,6 +1318,7 @@ local HELP = {
   "",
   " Commands",
   "   :AgentEditsClear  forget this project's edits (! for all of them)",
+  "   :AgentEditsUndoRevert  undo the last R (! even if the file changed since)",
   "   :AgentEditsHelp   this help",
   "",
   " Claude$ (a $ after the agent): the edit was inferred from a shell",
@@ -1113,6 +1412,11 @@ local function setup()
   map("gD", function() toggle_diff("head") end)
   map("o", function() open_in_editor(false) end)
   map("O", function() open_in_editor(true) end)
+  map("R", revert_here)
+  vim.keymap.set("x", "R", function() revert_files(visual_range()) end,
+    { buffer = M.list_buf, silent = true, nowait = true })
+  vim.api.nvim_create_user_command("AgentEditsUndoRevert", function(o) undo_revert(o.bang) end,
+    { bang = true, desc = "agent-edits: undo the last revert (! even if the files changed since)" })
   map("]c", function() jump_change(1) end)
   map("[c", function() jump_change(-1) end)
   map("<C-h>", "<cmd>wincmd h<cr>")

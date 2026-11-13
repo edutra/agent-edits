@@ -97,12 +97,39 @@ local function select(rel)
   error("no row for " .. rel, 2)
 end
 
+-- Keys typed in the code window, with the cursor on `row`.
+local function code_keys(row, k)
+  vim.api.nvim_set_current_win(V().code_win)
+  vim.api.nvim_win_set_cursor(V().code_win, { row, 0 })
+  vim.api.nvim_feedkeys(vim.keycode(k), "x", false)
+end
+
+local function read(rel)
+  local fh = io.open(abs(rel), "rb")
+  if not fh then return nil end
+  local text = fh:read("*a")
+  fh:close()
+  return text
+end
+
+-- Messages shown with vim.notify since the last call.
+local notes = {}
+vim.notify = function(msg) notes[#notes + 1] = msg end
+local function notified()
+  local text = table.concat(notes, "\n")
+  notes = {}
+  return text
+end
+
 -- Back to a clean slate between tests.
 local function reset()
   keys("F")
   V().grouped, V().folded = false, {}
+  V().confirm = function() return true end
   vim.fn.delete(state .. "/baselines", "rf")
+  vim.fn.delete(state .. "/reverted", "rf")
   write(state .. "/reviewed.tsv", "")
+  notified()
 end
 
 -- Tests -----------------------------------------------------------------------
@@ -279,6 +306,123 @@ test("H hides files with nothing left to commit", function()
   -- git status runs in the background.
   assert(vim.wait(10000, function() return #names() == 2 end), "git status never finished")
   eq(names(), { "repo/dirty.txt", "repo/new.txt" }, "rows")
+end)
+
+-- Revert ------------------------------------------------------------------------
+
+test("R in the code reverts the changed lines under the cursor", function()
+  baseline("s1", "r.txt", "a\nb\nc\nd\ne\n")
+  file("r.txt", "a\nB\nc\nD\ne\n")
+  log({ { 5, "Claude", "r.txt" } })
+  select("r.txt")
+  code_keys(4, "R")
+  eq(read("r.txt"), "a\nB\nc\nd\ne\n", "file")
+  eq(V().stats[abs("r.txt")], { add = 0, change = 1, delete = 0 }, "stats")
+end)
+
+test("R reverts deleted and added lines", function()
+  baseline("s1", "d.txt", "a\nb\nc\n")
+  file("d.txt", "new\na\nc\n")
+  log({ { 5, "Claude", "d.txt" } })
+  select("d.txt")
+  code_keys(2, "R") -- "b" was deleted below line 2
+  eq(read("d.txt"), "new\na\nb\nc\n", "after the deletion")
+  code_keys(1, "R")
+  eq(read("d.txt"), "a\nb\nc\n", "after the addition")
+end)
+
+test("R in the diff window reverts the change under the cursor", function()
+  baseline("s1", "w.txt", "a\nb\nc\n")
+  file("w.txt", "a\nB\nc\nadded\n")
+  log({ { 5, "Claude", "w.txt" } })
+  select("w.txt")
+  keys("D")
+  assert(V().diff_win, "no diff window")
+  vim.api.nvim_set_current_win(V().diff_win)
+  vim.api.nvim_win_set_cursor(V().diff_win, { 2, 0 })
+  vim.api.nvim_feedkeys("R", "x", false)
+  eq(read("w.txt"), "a\nb\nc\nadded\n", "file")
+  eq(V().diff_win, nil, "diff closed after the revert")
+end)
+
+test("R keeps a missing final newline and the file mode", function()
+  baseline("s1", "n.sh", "a\nb")
+  file("n.sh", "a\nB")
+  vim.uv.fs_chmod(abs("n.sh"), tonumber("755", 8))
+  log({ { 5, "Claude", "n.sh" } })
+  select("n.sh")
+  code_keys(2, "R")
+  eq(read("n.sh"), "a\nb", "file")
+  eq(vim.uv.fs_stat(abs("n.sh")).mode % 4096, tonumber("755", 8), "mode")
+end)
+
+test("R refuses when the file changed under the viewer", function()
+  baseline("s1", "c.txt", "a\n")
+  file("c.txt", "b\n")
+  log({ { 5, "Claude", "c.txt" } })
+  select("c.txt")
+  file("c.txt", "agent was here\n")
+  code_keys(1, "R")
+  eq(read("c.txt"), "agent was here\n", "file")
+  has(notified(), "the file changed", "message")
+end)
+
+test("R asks first", function()
+  baseline("s1", "q.txt", "a\n")
+  file("q.txt", "b\n")
+  log({ { 5, "Claude", "q.txt" } })
+  select("q.txt")
+  local asked
+  V().confirm = function(question) asked = question return false end
+  code_keys(1, "R")
+  has(asked, "q.txt", "question")
+  eq(read("q.txt"), "b\n", "file")
+  keys("R")
+  eq(read("q.txt"), "b\n", "file after declining in the list")
+end)
+
+test("R without a snapshot says why", function()
+  file("shell.txt", "x\n")
+  log({ { 5, "Claude", "shell.txt", via = "shell" } })
+  select("shell.txt")
+  keys("R")
+  eq(read("shell.txt"), "x\n", "file")
+  has(notified(), "no snapshot", "message")
+end)
+
+test("R in the list reverts whole files, :AgentEditsUndoRevert undoes it", function()
+  baseline("s1", "edited.txt", "old\n")
+  file("edited.txt", "new\n")
+  vim.fn.mkdir(state .. "/baselines/s1", "p")
+  write(state .. "/baselines/s1/" .. vim.fn.sha256(abs("created.txt")) .. ".new", "")
+  file("created.txt", "made by the agent\n")
+  baseline("s1", "deleted.txt", "was here\n")
+  log({ { 10, "Claude", "edited.txt" }, { 20, "Claude", "created.txt" }, { 30, "Claude", "deleted.txt" } })
+  keys("gg")
+  keys("VGR")
+  eq({ read("edited.txt"), read("created.txt"), read("deleted.txt") }, { "old\n", nil, "was here\n" }, "files")
+  has(read(state .. "/reviewed.tsv"), abs("edited.txt"), "reviewed marks")
+
+  vim.cmd("AgentEditsUndoRevert")
+  eq({ read("edited.txt"), read("created.txt"), read("deleted.txt") },
+    { "new\n", "made by the agent\n", nil }, "files after the undo")
+  vim.cmd("AgentEditsUndoRevert")
+  has(notified(), "nothing to undo", "second undo")
+end)
+
+test("the undo refuses when the agent edited the file since", function()
+  baseline("s1", "u.txt", "old\n")
+  file("u.txt", "new\n")
+  log({ { 5, "Claude", "u.txt" } })
+  select("u.txt")
+  keys("R")
+  eq(read("u.txt"), "old\n", "reverted")
+  file("u.txt", "agent edited it again\n")
+  vim.cmd("AgentEditsUndoRevert")
+  eq(read("u.txt"), "agent edited it again\n", "kept")
+  has(notified(), "changed since the revert", "message")
+  vim.cmd("AgentEditsUndoRevert!")
+  eq(read("u.txt"), "new\n", "forced")
 end)
 
 -- Runner ------------------------------------------------------------------------

@@ -119,12 +119,15 @@ is already running in the background, the same key brings it back as you left it
 | `]c` / `[c` | anywhere | Next / previous change. Changed lines are marked in the margin (`▎` added or changed, `▁` deleted below), and the code winbar shows `+added ~changed -deleted`. |
 | `o` | anywhere | Open the file in `$VISUAL` / `$EDITOR` (default `nvim`) in a new tmux window next to the agent's. From the code window it opens at the cursor line, from the list at the first change. The popup hides itself. |
 | `O` | anywhere | Same, but in a split next to the agent pane |
+| `R` | code | Revert the change under the cursor to what it was before the agent's session (also in the `D` diff window). Asks first. |
+| `R` | list | Revert the whole file, or every file in a visual selection of rows. A file the session created is deleted, a file it deleted is written back. Asks first, and marks the files as reviewed. |
 | `Ctrl-z` or `prefix + e` | anywhere | Hide the popup. The viewer keeps running. |
 | `:q`, `:qa`, `ZZ`, `ZQ` | list or code | Quit the viewer, as in plain Neovim |
 | `y` | visual selection | Paste the selected lines into the agent's prompt and keep the viewer open |
 | `d` / `Enter` | visual selection | Paste into the agent's prompt and hide the popup |
 | `c` | visual selection | Ask for a comment, then paste the code followed by the comment. The viewer stays open, so you can queue several comments before you switch to the agent. `Esc` or an empty comment sends nothing. |
 | `:AgentEditsHelp` / `g?` | anywhere | Show these key bindings |
+| `:AgentEditsUndoRevert` | command | Put back what the last `R` replaced. It refuses when a file changed since the revert (the agent may have edited it again); `:AgentEditsUndoRevert!` puts it back anyway. Reverts are kept for 7 days. |
 | `:AgentEditsClear` | command | Forget this project's edits, after asking for confirmation. This uses the same project rule as `p`. `:AgentEditsClear!` forgets every edit. Snapshots that are no longer used are deleted. |
 
 All other Vim motions work in the code window: search, marks, `%`, `Ctrl-d`/`Ctrl-u`,
