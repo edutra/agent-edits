@@ -11,6 +11,7 @@ local root = (vim.env.AGENT_EDITS_ROOT or vim.fn.getcwd()):gsub("(.)/$", "%1")
 local state_dir = (vim.env.XDG_STATE_HOME or (vim.env.HOME .. "/.local/state")) .. "/agent-edits"
 local log_file = state_dir .. "/edits.tsv"
 local baselines_dir = state_dir .. "/baselines"
+local reviewed_file = state_dir .. "/reviewed.tsv"
 -- The hook script next to this file (nvim/viewer.lua -> bin/agent-edits-log).
 local this_file = vim.fn.resolve(debug.getinfo(1, "S").source:sub(2))
 local log_cmd = vim.fn.fnamemodify(this_file, ":h:h") .. "/bin/agent-edits-log"
@@ -52,8 +53,10 @@ local function display_name(path, project)
   return vim.fn.fnamemodify(path, ":~")
 end
 
+-- Files still to review first, then the reviewed ones; newest first within each.
 local function sort_entries(list)
   table.sort(list, function(a, b)
+    if a.reviewed ~= b.reviewed then return not a.reviewed end
     if a.ts == b.ts then return a.rel < b.rel end
     return a.ts > b.ts
   end)
@@ -63,8 +66,23 @@ end
 -- The logged files that still exist, newest first: the latest edit of each
 -- path (flat list), and the latest edit of each path per session (grouped
 -- list, where a file edited by two sessions belongs to both).
+-- reviewed.tsv: "<path>\t<edit time reviewed>". Returns the map and the raw
+-- text (part of the refresh signature, so marks made elsewhere show up).
+local function read_reviewed()
+  local marks, raw = {}, ""
+  local fh = io.open(reviewed_file, "r")
+  if fh then
+    raw = fh:read("*a")
+    fh:close()
+    for path, ts in raw:gmatch("([^\t\n]+)\t(%d+)") do marks[path] = tonumber(ts) end
+  end
+  return marks, raw
+end
+
 local function read_entries()
   local latest, per_session = {}, {}
+  local marks
+  marks, M.reviewed_raw = read_reviewed()
   local fh = io.open(log_file, "r")
   if fh then
     for line in fh:lines() do
@@ -82,6 +100,13 @@ local function read_entries()
       end
     end
     fh:close()
+  end
+  -- Reviewed until anyone edits the file again.
+  for _, t in ipairs({ latest, per_session }) do
+    for _, e in pairs(t) do
+      local mark = marks[e.path]
+      e.reviewed = mark ~= nil and latest[e.path] ~= nil and mark >= latest[e.path].ts
+    end
   end
   local exists = {}
   local function existing(t)
@@ -162,7 +187,8 @@ local function apply_filters(all)
     if (not f.agent or e.agent == f.agent)
       and (not f.session or e.session == f.session)
       and (not f.project or in_project(e))
-      and not (M.hide_committed and M.clean and M.clean[e.path]) then
+      and not (M.hide_committed and M.clean and M.clean[e.path])
+      and not (M.hide_reviewed and e.reviewed) then
       out[#out + 1] = e
     end
   end
@@ -175,6 +201,7 @@ local function filter_labels()
   if f.session then out[#out + 1] = "sess:" .. f.session:sub(1, 6) end
   if f.project then out[#out + 1] = "project" end
   if M.hide_committed then out[#out + 1] = "uncommitted" end
+  if M.hide_reviewed then out[#out + 1] = "to review" end
   return out
 end
 
@@ -276,7 +303,7 @@ local function fit(left, right, width)
 end
 
 local function render()
-  local lines, headers = {}, {}
+  local lines, headers, dimmed = {}, {}, {}
   if #M.rows == 0 and #filter_labels() > 0 then
     lines = { "", "  No files match the filters:", "  " .. table.concat(filter_labels(), " "),
       "", "  F clears them." }
@@ -292,11 +319,14 @@ local function render()
           string.format(" %d %s", #g.files, ago(g.ts)), LIST_WIDTH - 1)
         headers[#headers + 1] = i
       elseif M.grouped then
-        lines[i] = fit("   " .. row.entry.rel, " " .. ago(row.entry.ts), LIST_WIDTH - 1)
+        local e = row.entry
+        lines[i] = fit("   " .. e.rel, (e.reviewed and " ✓ " or " ") .. ago(e.ts), LIST_WIDTH - 1)
       else
         local e = row.entry
-        lines[i] = fit(" " .. e.rel, string.format(" %s %s", e.agent, ago(e.ts)), LIST_WIDTH - 1)
+        lines[i] = fit(" " .. e.rel, string.format(" %s%s %s", e.reviewed and "✓ " or "", e.agent,
+          ago(e.ts)), LIST_WIDTH - 1)
       end
+      if row.entry and row.entry.reviewed then dimmed[#dimmed + 1] = i end
     end
   end
   vim.bo[M.list_buf].modifiable = true
@@ -307,7 +337,18 @@ local function render()
     vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
       { line_hl_group = "Title", priority = 10 })
   end
+  for _, i in ipairs(dimmed) do
+    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
+      { line_hl_group = "Comment", priority = 10 })
+  end
   local count = #M.entries == M.total and tostring(M.total) or (#M.entries .. "/" .. M.total)
+  local to_review = 0
+  for _, e in ipairs(M.entries) do
+    if not e.reviewed then to_review = to_review + 1 end
+  end
+  if to_review < #M.entries then
+    count = string.format("%d to review / %s", to_review, count)
+  end
   local labels = filter_labels()
   if M.grouped then table.insert(labels, 1, "by session") end
   labels = table.concat(labels, " ")
@@ -342,7 +383,7 @@ local function refresh(force)
   if M.hide_committed then M.clean, git_sig = committed_files(all) end
   local entries = apply_filters(all)
   M.total, M.all = #all, all
-  local sig = { git_sig }
+  local sig = { git_sig, M.reviewed_raw }
   for _, e in ipairs(per_session) do sig[#sig + 1] = e.ts .. e.session .. e.path end
   sig = table.concat(sig, "\n")
   if not force and sig == M.signature then
@@ -721,7 +762,44 @@ end
 
 local function clear_filters()
   M.filters = { agent = nil, session = nil, project = false }
-  M.hide_committed = false
+  M.hide_committed, M.hide_reviewed = false, false
+  refresh(true)
+end
+
+-- x marks the file(s) as reviewed, or removes the mark. The mark stores the
+-- time of the latest edit, so a newer edit brings the file back.
+local function toggle_reviewed(first, last)
+  local paths, unmark = {}, nil
+  for row = first, last do
+    local r = M.rows[row]
+    if r and r.entry and not vim.tbl_contains(paths, r.entry.path) then
+      paths[#paths + 1] = r.entry.path
+      -- The first file decides: reviewed ones get unmarked, others marked.
+      if unmark == nil then unmark = r.entry.reviewed end
+    end
+  end
+  if #paths == 0 then return end
+  local ts = 0
+  if not unmark then
+    for _, e in ipairs(M.all or {}) do
+      if vim.tbl_contains(paths, e.path) then ts = math.max(ts, e.ts) end
+    end
+  end
+  vim.fn.system(vim.list_extend({ log_cmd, "--reviewed", tostring(ts) }, paths))
+  local keep = selected()
+  refresh(true)
+  if unmark then
+    if keep then select_path(keep.path, keep.session) end
+  else
+    -- Inbox style: the reviewed files sink, so stay on the same row, which
+    -- now holds the next file to review.
+    vim.api.nvim_win_set_cursor(M.list_win, { math.min(first, math.max(#M.rows, 1)), 0 })
+    move(0)
+  end
+end
+
+local function toggle_hide_reviewed()
+  M.hide_reviewed = not M.hide_reviewed
   refresh(true)
 end
 
@@ -764,6 +842,9 @@ local HELP = {
   "   a                 filter by agent: all, Claude, Codex, Grok",
   "   s                 only the session of the selected file (toggle)",
   "   p                 only this project (toggle)",
+  "   x                 mark / unmark as reviewed (also on a visual",
+  "                     selection); a new edit brings the file back",
+  "   X                 hide reviewed files (toggle)",
   "   H                 hide files with nothing left to commit (toggle)",
   "   F                 clear the filters",
   "   @                 paste @path into the agent's prompt (also on a",
@@ -844,6 +925,13 @@ local function setup()
   map("p", toggle_project, lb)
   map("F", clear_filters, lb)
   map("H", toggle_hide_committed, lb)
+  map("x", function()
+    local row = vim.api.nvim_win_get_cursor(M.list_win)[1]
+    toggle_reviewed(row, row)
+  end, lb)
+  vim.keymap.set("x", "x", function() toggle_reviewed(visual_range()) end,
+    { buffer = M.list_buf, silent = true, nowait = true })
+  map("X", toggle_hide_reviewed, lb)
   vim.api.nvim_create_user_command("AgentEditsClear", function(o) clear_history(o.bang) end,
     { bang = true, desc = "agent-edits: forget this project's edits (! for all)" })
   map("@", function()

@@ -15,6 +15,8 @@ Also a maintenance command, used by the viewer:
   agent-edits-log --clear DIR [--dry-run]   forget the edits of the project in DIR
   agent-edits-log --clear-all [--dry-run]   forget every edit
 Both print the number of log lines removed (or that would be).
+  agent-edits-log --reviewed TS PATH...     mark files reviewed up to edit time TS
+                                            (TS 0 removes the mark)
 
 Everything lives in $XDG_STATE_HOME/agent-edits. Works with Claude Code
 (tool_name/tool_input), Grok (toolName/toolInput, also loads Claude's hooks)
@@ -35,6 +37,7 @@ STATE_DIR = os.path.join(
     "agent-edits",
 )
 LOG = os.path.join(STATE_DIR, "edits.tsv")
+REVIEWED = os.path.join(STATE_DIR, "reviewed.tsv")
 BASELINES = os.path.join(STATE_DIR, "baselines")
 PRUNE_BYTES = 1_000_000
 KEEP_SECONDS = 14 * 24 * 3600
@@ -204,7 +207,37 @@ def clear(root, dry_run):
     print(removed)
 
 
+def set_reviewed(ts, paths):
+    """reviewed.tsv holds "<path>\t<edit time reviewed>". A file counts as
+    reviewed while no edit is newer than that time. Marks for paths that left
+    the log are dropped."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    logged = set()
+    if os.path.exists(LOG):
+        with open(LOG, encoding="utf-8", errors="replace") as fh:
+            logged = {l.split("\t")[2] for l in fh if l.count("\t") >= 2}
+    with open(REVIEWED, "a+", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.seek(0)
+        marks = {}
+        for line in fh:
+            path, _, mark = line.rstrip("\n").partition("\t")
+            if path in logged and mark.isdigit():
+                marks[path] = mark
+        for path in paths:
+            if ts == "0":
+                marks.pop(path, None)
+            else:
+                marks[path] = ts
+        fh.seek(0)
+        fh.truncate()
+        fh.writelines(f"{p}\t{m}\n" for p, m in sorted(marks.items()))
+
+
 def main():
+    if len(sys.argv) > 3 and sys.argv[1] == "--reviewed":
+        set_reviewed(sys.argv[2], sys.argv[3:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] in ("--clear", "--clear-all"):
         dry_run = "--dry-run" in sys.argv
         args = [a for a in sys.argv[2:] if a != "--dry-run"]
