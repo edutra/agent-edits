@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Adds/removes agent-edits entries in agent hook files and tmux.conf.
 
-  config_patch.py hooks-add    FILE MATCHER COMMAND
+  config_patch.py hooks-add    FILE EVENT MATCHER COMMAND
   config_patch.py hooks-remove FILE
   config_patch.py tmux-add     FILE BLOCK_TEXT
   config_patch.py tmux-remove  FILE
 
 Entries are identified by the marker "agent-edits-log" (hooks) or by the
 ">>> agent-edits >>>" comment block (tmux), so other hooks and settings are
-never touched. Every command is idempotent and prints what it did.
+never touched. Every command is idempotent and prints what it did; running
+hooks-add again updates our entry in place.
 """
 import json
 import os
 import sys
 
 HOOK_MARKER = "agent-edits-log"
-EVENT = "PostToolUse"
 TMUX_BEGIN = "# >>> agent-edits >>>"
 TMUX_END = "# <<< agent-edits <<<"
 
@@ -42,36 +42,53 @@ def is_ours(group):
     return any(HOOK_MARKER in h.get("command", "") for h in group.get("hooks", []))
 
 
-def hooks_add(path, matcher, command):
+def hooks_add(path, event, matcher, command):
+    """Add our group to EVENT, or update it in place if it changed.
+
+    In place matters: Codex keys a hook's trust on its position in the file.
+    """
     data, newline = load_json(path)
-    groups = data.setdefault("hooks", {}).setdefault(EVENT, [])
-    if any(is_ours(g) for g in groups):
-        print(f"  hook already present in {path}")
-        return
-    groups.append({
+    groups = data.setdefault("hooks", {}).setdefault(event, [])
+    group = {
         "matcher": matcher,
         "hooks": [{"type": "command", "command": command, "timeout": 5}],
-    })
+    }
+    for i, existing in enumerate(groups):
+        if is_ours(existing):
+            if existing == group:
+                print(f"  {event} hook already up to date in {path}")
+                return
+            groups[i] = group
+            save_json(path, data, newline)
+            print(f"  updated {event} hook in {path}")
+            return
+    groups.append(group)
     save_json(path, data, newline)
-    print(f"  added {EVENT} hook to {path}")
+    print(f"  added {event} hook to {path}")
 
 
 def hooks_remove(path):
+    """Remove our groups from every event; drop events left empty."""
     if not os.path.exists(path):
         return
     data, newline = load_json(path)
     hooks = data.get("hooks", {})
-    groups = hooks.get(EVENT, [])
-    kept = [g for g in groups if not is_ours(g)]
-    if len(kept) == len(groups):
+    removed = []
+    for event in list(hooks):
+        groups = hooks[event]
+        kept = [g for g in groups if not is_ours(g)]
+        if len(kept) == len(groups):
+            continue
+        removed.append(event)
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event)
+    if not removed:
         print(f"  no agent-edits hook in {path}")
         return
-    if kept:
-        hooks[EVENT] = kept
-    else:
-        hooks.pop(EVENT, None)
     save_json(path, data, newline)
-    print(f"  removed {EVENT} hook from {path}")
+    print(f"  removed {', '.join(removed)} hook(s) from {path}")
 
 
 def strip_block(text):
