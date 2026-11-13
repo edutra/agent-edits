@@ -199,11 +199,31 @@ agent-edits/
 │   └── inner.conf          # config of the private tmux server that keeps viewers alive
 ├── lib/
 │   └── config_patch.py     # idempotent add/remove of the hook entries and the tmux block
+├── tests/
+│   ├── run.sh              # runs every test
+│   ├── test_hook.py        # the hook, fed with the events in fixtures/
+│   ├── test_install.py     # install.sh and uninstall.sh against a temporary HOME
+│   ├── test_popup.py       # the popup starts a viewer once and re-attaches to it
+│   ├── test_viewer.py      # runs viewer/run.lua in a headless Neovim
+│   └── fixtures/           # one hook event per agent and tool
 ├── install.sh
 ├── uninstall.sh
 ├── LICENSE
 └── README.md
 ```
+
+## Development
+
+```sh
+tests/run.sh          # every test, about 5 seconds
+tests/run.sh -v       # one line per test
+tests/run.sh -k shell # only the tests whose name contains "shell"
+```
+
+The tests need `python3`, `git` and Neovim; the tmux ones are skipped without tmux 3.3 or newer.
+They never touch your configuration or your tmux server: each test gets a temporary `HOME`,
+state directory and `TMUX_TMPDIR`. GitHub Actions runs them on Linux and macOS, with the
+oldest supported Python and Neovim too, and runs `shellcheck` on the shell scripts.
 
 ## License
 

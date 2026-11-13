@@ -1,0 +1,1 @@
+{"session_id": "codex-session-1", "cwd": "@CWD@", "hook_event_name": "@EVENT@", "tool_name": "apply_patch", "tool_input": {"input": "*** Begin Patch\n*** Add File: added.txt\n+new\n*** Update File: sub/updated.txt\n@@\n-old\n+new\n*** Delete File: deleted.txt\n*** Update File: moved.txt\n*** Move to: renamed.txt\n*** End Patch\n"}, "tool_use_id": "call_01"}
