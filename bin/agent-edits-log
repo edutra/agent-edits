@@ -4,12 +4,19 @@
 Registered for PreToolUse and PostToolUse on the agents' edit tools. Reads the
 hook event (JSON) from stdin.
 
+Edit tools:
 PreToolUse   saves a baseline of each file the tool is about to touch, once
              per agent session, in baselines/<session>/<sha256(path)>, so the
              viewer can diff against the file as it was before the session.
 PostToolUse  appends one line per edited file to edits.tsv:
-               <epoch> <agent> <path> <project> <session>
-             <project> is the directory the agent session was started in.
+               <epoch> <agent> <path> <project> <session> <via>
+             <project> is the directory the agent session was started in;
+             <via> is "tool".
+Shell tools (Bash and friends):
+PreToolUse   notes the start time and working directory of the command.
+PostToolUse  logs the files under that directory modified since then, with
+             <via> "shell". Inside git: modified and untracked files, ignored
+             ones excluded. Outside git: a bounded directory walk.
 
 Also a maintenance command, used by the viewer:
   agent-edits-log --clear DIR [--dry-run]   forget the edits of the project in DIR
@@ -29,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -47,6 +55,12 @@ PATH_KEYS = ("file_path", "filePath", "path", "target_file", "targetFile", "note
 PATCH_RE = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.M)
 # Grok's camelCase event names, mapped to the names Claude and Codex use.
 GROK_EVENTS = {"pre_tool_use": "PreToolUse", "post_tool_use": "PostToolUse"}
+SHELL_TOOLS = {"Bash", "run_terminal_command", "shell", "shell_command", "exec_command",
+               "local_shell", "unified_exec"}
+PENDING = os.path.join(STATE_DIR, "pending")
+MAX_SHELL_FILES = 200
+WALK_LIMIT, WALK_SECONDS = 20_000, 0.5
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "target", "dist", "build"}
 
 
 def collect(value, found):
@@ -147,19 +161,107 @@ def prune():
             for entry in os.scandir(BASELINES):
                 if entry.is_dir() and entry.stat().st_mtime < cutoff:
                     shutil.rmtree(entry.path, ignore_errors=True)
+        if os.path.isdir(PENDING):
+            # Shell calls whose PostToolUse never came (denied, interrupted).
+            for entry in os.scandir(PENDING):
+                if entry.stat().st_mtime < time.time() - 86400:
+                    os.remove(entry.path)
     except OSError:
         pass
 
 
-def log_edits(event, paths, cwd):
+def log_edits(event, paths, cwd, via="tool"):
     agent = agent_name(event)
     project = project_dir(event, cwd)
     session = session_id(event)
     now = int(time.time())
     with open(LOG, "a", encoding="utf-8") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\t{session}\n" for p in paths)
+        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\t{session}\t{via}\n" for p in paths)
         prune()
+
+
+def tool_name(event):
+    return str(event.get("tool_name") or event.get("toolName") or "")
+
+
+def shell_workdir(event, cwd):
+    tool_input = event.get("tool_input", event.get("toolInput")) or {}
+    workdir = ""
+    if isinstance(tool_input, dict):
+        workdir = tool_input.get("workdir") or tool_input.get("cwd") or ""
+    return os.path.normpath(os.path.join(cwd, os.path.expanduser(str(workdir))))
+
+
+def pending_file(event):
+    call = str(event.get("tool_use_id") or event.get("toolUseId") or "shell")
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{session_id(event)}-{call}")[:150]
+    return os.path.join(PENDING, name)
+
+
+def changed_since(workdir, start_ns):
+    """Files under workdir modified at or after start_ns (nanoseconds)."""
+    candidates = []
+    try:
+        out = subprocess.run(
+            ["git", "-C", workdir, "ls-files", "-m", "-o", "--exclude-standard", "-z", "--", "."],
+            capture_output=True, timeout=3,
+        )
+        in_git = out.returncode == 0
+        if in_git:
+            # A directory ignored by an enclosing repository (e.g. a project
+            # inside a dotfiles repo) would list nothing: walk it instead.
+            in_git = subprocess.run(["git", "-C", workdir, "check-ignore", "-q", "."],
+                                    capture_output=True, timeout=3).returncode != 0
+    except (OSError, subprocess.SubprocessError):
+        in_git = False
+    if in_git:
+        # ls-files prints paths relative to workdir.
+        candidates = [os.path.join(workdir, p.decode(errors="surrogateescape"))
+                      for p in out.stdout.split(b"\0") if p]
+    else:
+        deadline, seen = time.monotonic() + WALK_SECONDS, 0
+        stack = [workdir]
+        while stack and seen < WALK_LIMIT and time.monotonic() < deadline:
+            try:
+                entries = list(os.scandir(stack.pop()))
+            except OSError:
+                continue
+            for entry in entries:
+                seen += 1
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in SKIP_DIRS and not entry.name.startswith("."):
+                        stack.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    candidates.append(entry.path)
+    changed = []
+    for path in dict.fromkeys(candidates):
+        try:
+            if os.stat(path).st_mtime_ns >= start_ns:
+                changed.append(os.path.normpath(path))
+        except OSError:
+            continue
+        if len(changed) >= MAX_SHELL_FILES:
+            break
+    return changed
+
+
+def handle_shell(event, cwd):
+    marker = pending_file(event)
+    if event_name(event) == "PreToolUse":
+        os.makedirs(PENDING, exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write(f"{time.time_ns()}\t{shell_workdir(event, cwd)}\n")
+        return
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            start, _, workdir = fh.read().rstrip("\n").partition("\t")
+        os.remove(marker)
+    except OSError:
+        return
+    paths = changed_since(workdir, int(start))
+    if paths:
+        log_edits(event, paths, cwd, via="shell")
 
 
 def under(path, folder):
@@ -251,6 +353,9 @@ def main():
 
     event = json.loads(raw)
     cwd = event.get("cwd") or event.get("workspaceRoot") or os.getcwd()
+    if tool_name(event) in SHELL_TOOLS:
+        handle_shell(event, cwd)
+        return
     paths = edited_paths(event, cwd)
     if not paths:
         return
