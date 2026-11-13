@@ -71,8 +71,8 @@ say "Checking dependencies"
 for cmd in python3 nvim git; do
   command -v "$cmd" >/dev/null || die "'$cmd' not found in PATH"
 done
-nvim --headless -c 'if !has("nvim-0.9") | cquit | endif' -c 'qa!' 2>/dev/null \
-  || die "Neovim 0.9 or newer is required"
+nvim --headless -c 'if !has("nvim-0.10") | cquit | endif' -c 'qa!' 2>/dev/null \
+  || die "Neovim 0.10 or newer is required"
 if ((do_tmux)); then
   command -v tmux >/dev/null || die "'tmux' not found (use --no-tmux to skip)"
   tmux_ver="$(tmux -V | grep -oE '[0-9]+\.[0-9]+' | head -1)"
