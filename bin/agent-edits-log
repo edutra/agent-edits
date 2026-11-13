@@ -1,20 +1,42 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: records every file an AI agent edits.
+"""Agent hook: records every file an AI agent edits.
 
-Reads the hook event (JSON) from stdin and appends one line per edited file to
-$XDG_STATE_HOME/agent-edits/edits.tsv:
-  <epoch>\t<agent>\t<absolute path>\t<project>
-where <project> is the directory the agent session was started in, so the
-viewer can show every file a project's agents touched, even outside it.
+Registered for PreToolUse and PostToolUse on the agents' edit tools. Reads the
+hook event (JSON) from stdin.
 
-Works with Claude Code (tool_name/tool_input), Grok (toolName/toolInput, also
-loads Claude's hooks) and Codex (apply_patch patch text). It never fails the
-agent: any error is swallowed and the exit code is always 0.
+Edit tools:
+PreToolUse   saves a baseline of each file the tool is about to touch, once
+             per agent session, in baselines/<session>/<sha256(path)>, so the
+             viewer can diff against the file as it was before the session.
+PostToolUse  appends one line per edited file to edits.tsv:
+               <epoch> <agent> <path> <project> <session> <via>
+             <project> is the directory the agent session was started in;
+             <via> is "tool".
+Shell tools (Bash and friends):
+PreToolUse   notes the start time and working directory of the command.
+PostToolUse  logs the files under that directory modified since then, with
+             <via> "shell". Inside git: modified and untracked files, ignored
+             ones excluded. Outside git: a bounded directory walk.
+
+Also a maintenance command, used by the viewer:
+  agent-edits-log --clear DIR [--dry-run]   forget the edits of the project in DIR
+  agent-edits-log --clear-all [--dry-run]   forget every edit
+Both print the number of log lines removed (or that would be).
+  agent-edits-log --reviewed TS PATH...     mark files reviewed up to edit time TS
+                                            (TS 0 removes the mark)
+
+Everything lives in $XDG_STATE_HOME/agent-edits. Works with Claude Code
+(tool_name/tool_input), Grok (toolName/toolInput, also loads Claude's hooks)
+and Codex (apply_patch patch text). It never fails the agent: any error is
+swallowed and the exit code is always 0.
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 
@@ -23,11 +45,22 @@ STATE_DIR = os.path.join(
     "agent-edits",
 )
 LOG = os.path.join(STATE_DIR, "edits.tsv")
+REVIEWED = os.path.join(STATE_DIR, "reviewed.tsv")
+BASELINES = os.path.join(STATE_DIR, "baselines")
 PRUNE_BYTES = 1_000_000
 KEEP_SECONDS = 14 * 24 * 3600
+MAX_BASELINE_BYTES = 2_000_000
 
 PATH_KEYS = ("file_path", "filePath", "path", "target_file", "targetFile", "notebook_path")
 PATCH_RE = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.M)
+# Grok's camelCase event names, mapped to the names Claude and Codex use.
+GROK_EVENTS = {"pre_tool_use": "PreToolUse", "post_tool_use": "PostToolUse"}
+SHELL_TOOLS = {"Bash", "run_terminal_command", "shell", "shell_command", "exec_command",
+               "local_shell", "unified_exec"}
+PENDING = os.path.join(STATE_DIR, "pending")
+MAX_SHELL_FILES = 200
+WALK_LIMIT, WALK_SECONDS = 20_000, 0.5
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "target", "dist", "build"}
 
 
 def collect(value, found):
@@ -45,11 +78,22 @@ def collect(value, found):
         found.extend(m.strip() for m in PATCH_RE.findall(value))
 
 
+def event_name(event):
+    name = event.get("hook_event_name") or GROK_EVENTS.get(event.get("hookEventName", ""), "")
+    return name or "PostToolUse"
+
+
 def agent_name(event):
     # Grok runs the hooks it finds in ~/.claude/settings.json and adds camelCase keys.
     if "hookEventName" in event:
         return "Grok"
     return sys.argv[1] if len(sys.argv) > 1 else "agent"
+
+
+def session_id(event):
+    sid = str(event.get("session_id") or event.get("sessionId") or "")
+    sid = re.sub(r"[^A-Za-z0-9._-]", "_", sid)[:80]
+    return sid or "-"
 
 
 def project_dir(event, cwd):
@@ -66,37 +110,9 @@ def project_dir(event, cwd):
     return os.path.normpath(os.path.expanduser(base))
 
 
-def prune():
-    try:
-        if os.path.getsize(LOG) < PRUNE_BYTES:
-            return
-        cutoff = time.time() - KEEP_SECONDS
-        with open(LOG, encoding="utf-8", errors="replace") as fh:
-            lines = [l for l in fh if l.split("\t", 1)[0].isdigit() and int(l.split("\t", 1)[0]) >= cutoff]
-        with open(LOG, "w", encoding="utf-8") as fh:
-            fh.writelines(lines)
-    except OSError:
-        pass
-
-
-def main():
-    raw = sys.stdin.read()
-    os.makedirs(STATE_DIR, exist_ok=True)
-    if os.environ.get("AGENT_EDITS_DEBUG"):
-        with open(os.path.join(STATE_DIR, "debug.jsonl"), "a", encoding="utf-8") as fh:
-            fh.write(raw.strip() + "\n")
-
-    event = json.loads(raw)
-    tool_input = event.get("tool_input", event.get("toolInput"))
+def edited_paths(event, cwd):
     found = []
-    collect(tool_input, found)
-    if not found:
-        return
-
-    cwd = event.get("cwd") or event.get("workspaceRoot") or os.getcwd()
-    agent = agent_name(event)
-    project = project_dir(event, cwd)
-    now = int(time.time())
+    collect(event.get("tool_input", event.get("toolInput")), found)
     paths = []
     for p in found:
         p = os.path.expanduser(p)
@@ -105,11 +121,248 @@ def main():
         p = os.path.normpath(os.path.join(cwd, p))
         if p not in paths:
             paths.append(p)
+    return paths
 
+
+def baseline_key(path):
+    return hashlib.sha256(path.encode()).hexdigest()
+
+
+def save_baselines(session, paths):
+    """Keep each file as it was before the session's first edit to it."""
+    if session == "-":
+        return
+    folder = os.path.join(BASELINES, session)
+    os.makedirs(folder, exist_ok=True)
+    for path in paths:
+        base = os.path.join(folder, baseline_key(path))
+        if any(os.path.exists(base + ext) for ext in ("", ".new", ".skip")):
+            continue
+        if not os.path.exists(path):
+            open(base + ".new", "w").close()
+        elif not os.path.isfile(path) or os.path.getsize(path) > MAX_BASELINE_BYTES:
+            open(base + ".skip", "w").close()
+        else:
+            shutil.copyfile(path, base + ".tmp")
+            os.replace(base + ".tmp", base)
+
+
+def prune():
+    """Drop log lines and baselines older than KEEP_SECONDS once the log is big."""
+    try:
+        if os.path.getsize(LOG) < PRUNE_BYTES:
+            return
+        cutoff = time.time() - KEEP_SECONDS
+        with open(LOG, encoding="utf-8", errors="replace") as fh:
+            lines = [l for l in fh if l.split("\t", 1)[0].isdigit() and int(l.split("\t", 1)[0]) >= cutoff]
+        with open(LOG, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+        if os.path.isdir(BASELINES):
+            for entry in os.scandir(BASELINES):
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry.path, ignore_errors=True)
+        if os.path.isdir(PENDING):
+            # Shell calls whose PostToolUse never came (denied, interrupted).
+            for entry in os.scandir(PENDING):
+                if entry.stat().st_mtime < time.time() - 86400:
+                    os.remove(entry.path)
+    except OSError:
+        pass
+
+
+def log_edits(event, paths, cwd, via="tool"):
+    agent = agent_name(event)
+    project = project_dir(event, cwd)
+    session = session_id(event)
+    now = int(time.time())
     with open(LOG, "a", encoding="utf-8") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\n" for p in paths)
+        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\t{session}\t{via}\n" for p in paths)
         prune()
+
+
+def tool_name(event):
+    return str(event.get("tool_name") or event.get("toolName") or "")
+
+
+def shell_workdir(event, cwd):
+    tool_input = event.get("tool_input", event.get("toolInput")) or {}
+    workdir = ""
+    if isinstance(tool_input, dict):
+        workdir = tool_input.get("workdir") or tool_input.get("cwd") or ""
+    return os.path.normpath(os.path.join(cwd, os.path.expanduser(str(workdir))))
+
+
+def pending_file(event):
+    call = str(event.get("tool_use_id") or event.get("toolUseId") or "shell")
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{session_id(event)}-{call}")[:150]
+    return os.path.join(PENDING, name)
+
+
+def changed_since(workdir, start_ns):
+    """Files under workdir modified at or after start_ns (nanoseconds)."""
+    candidates = []
+    try:
+        out = subprocess.run(
+            ["git", "-C", workdir, "ls-files", "-m", "-o", "--exclude-standard", "-z", "--", "."],
+            capture_output=True, timeout=3,
+        )
+        in_git = out.returncode == 0
+        if in_git:
+            # A directory ignored by an enclosing repository (e.g. a project
+            # inside a dotfiles repo) would list nothing: walk it instead.
+            in_git = subprocess.run(["git", "-C", workdir, "check-ignore", "-q", "."],
+                                    capture_output=True, timeout=3).returncode != 0
+    except (OSError, subprocess.SubprocessError):
+        in_git = False
+    if in_git:
+        # ls-files prints paths relative to workdir.
+        candidates = [os.path.join(workdir, p.decode(errors="surrogateescape"))
+                      for p in out.stdout.split(b"\0") if p]
+    else:
+        deadline, seen = time.monotonic() + WALK_SECONDS, 0
+        stack = [workdir]
+        while stack and seen < WALK_LIMIT and time.monotonic() < deadline:
+            try:
+                entries = list(os.scandir(stack.pop()))
+            except OSError:
+                continue
+            for entry in entries:
+                seen += 1
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in SKIP_DIRS and not entry.name.startswith("."):
+                        stack.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    candidates.append(entry.path)
+    changed = []
+    for path in dict.fromkeys(candidates):
+        try:
+            if os.stat(path).st_mtime_ns >= start_ns:
+                changed.append(os.path.normpath(path))
+        except OSError:
+            continue
+        if len(changed) >= MAX_SHELL_FILES:
+            break
+    return changed
+
+
+def handle_shell(event, cwd):
+    marker = pending_file(event)
+    if event_name(event) == "PreToolUse":
+        os.makedirs(PENDING, exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write(f"{time.time_ns()}\t{shell_workdir(event, cwd)}\n")
+        return
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            start, _, workdir = fh.read().rstrip("\n").partition("\t")
+        os.remove(marker)
+    except OSError:
+        return
+    paths = changed_since(workdir, int(start))
+    if paths:
+        log_edits(event, paths, cwd, via="shell")
+
+
+def under(path, folder):
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+def in_project(path, project, root):
+    """Same rule as the viewer's project filter (nvim/viewer.lua in_project)."""
+    if under(path, root):
+        return True
+    if not project:
+        return False
+    if under(project, root):
+        return True
+    return under(root, project) and project not in (os.path.expanduser("~"), "/")
+
+
+def clear(root, dry_run):
+    """Remove log lines (all of them when root is None), then baselines of
+    sessions that no longer appear in the log. Prints the number removed."""
+    if not os.path.exists(LOG):
+        print(0)
+        return
+    root = os.path.normpath(root) if root else None
+    with open(LOG, "r+", encoding="utf-8", errors="replace") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        kept, removed = [], 0
+        for line in fh:
+            cols = line.rstrip("\n").split("\t")
+            path = cols[2] if len(cols) > 2 else ""
+            project = cols[3] if len(cols) > 3 else ""
+            if root is None or in_project(path, project, root):
+                removed += 1
+            else:
+                kept.append(line)
+        if not dry_run and removed:
+            fh.seek(0)
+            fh.writelines(kept)
+            fh.truncate()
+            sessions = {l.rstrip("\n").split("\t")[4] for l in kept if l.count("\t") >= 4}
+            if os.path.isdir(BASELINES):
+                for entry in os.scandir(BASELINES):
+                    if entry.is_dir() and entry.name not in sessions:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+    print(removed)
+
+
+def set_reviewed(ts, paths):
+    """reviewed.tsv holds "<path>\t<edit time reviewed>". A file counts as
+    reviewed while no edit is newer than that time. Marks for paths that left
+    the log are dropped."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    logged = set()
+    if os.path.exists(LOG):
+        with open(LOG, encoding="utf-8", errors="replace") as fh:
+            logged = {l.split("\t")[2] for l in fh if l.count("\t") >= 2}
+    with open(REVIEWED, "a+", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.seek(0)
+        marks = {}
+        for line in fh:
+            path, _, mark = line.rstrip("\n").partition("\t")
+            if path in logged and mark.isdigit():
+                marks[path] = mark
+        for path in paths:
+            if ts == "0":
+                marks.pop(path, None)
+            else:
+                marks[path] = ts
+        fh.seek(0)
+        fh.truncate()
+        fh.writelines(f"{p}\t{m}\n" for p, m in sorted(marks.items()))
+
+
+def main():
+    if len(sys.argv) > 3 and sys.argv[1] == "--reviewed":
+        set_reviewed(sys.argv[2], sys.argv[3:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] in ("--clear", "--clear-all"):
+        dry_run = "--dry-run" in sys.argv
+        args = [a for a in sys.argv[2:] if a != "--dry-run"]
+        clear(args[0] if sys.argv[1] == "--clear" else None, dry_run)
+        return
+    raw = sys.stdin.read()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.environ.get("AGENT_EDITS_DEBUG"):
+        with open(os.path.join(STATE_DIR, "debug.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(raw.strip() + "\n")
+
+    event = json.loads(raw)
+    cwd = event.get("cwd") or event.get("workspaceRoot") or os.getcwd()
+    if tool_name(event) in SHELL_TOOLS:
+        handle_shell(event, cwd)
+        return
+    paths = edited_paths(event, cwd)
+    if not paths:
+        return
+    if event_name(event) == "PreToolUse":
+        save_baselines(session_id(event), paths)
+    else:
+        log_edits(event, paths, cwd)
 
 
 if __name__ == "__main__":

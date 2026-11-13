@@ -10,8 +10,14 @@ CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 CODEX_HOOKS="${CODEX_HOME:-$HOME/.codex}/hooks.json"
 PATCH=(python3 "$REPO/lib/config_patch.py")
 
+# Tools whose calls the hook logs, per agent. Grok reads Claude's settings and
+# maps Claude's tool names to its own.
+# Shell tools are watched too, to catch files changed by commands.
+CLAUDE_MATCHER="Edit|Write|MultiEdit|NotebookEdit|Bash"
+CODEX_MATCHER="apply_patch|Edit|Write|Bash|shell|shell_command|exec_command|local_shell|unified_exec"
+
 key="e"
-do_claude=1 do_codex=1 do_tmux=1
+do_claude=1 do_codex=1 do_tmux=1 codex_notice=0
 
 usage() {
   cat <<EOF
@@ -41,20 +47,38 @@ say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-backup() {
-  [[ -f "$1" ]] || return 0
-  local dest
-  dest="$1.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
-  cp -p "$1" "$dest"
-  echo "  backup: $dest"
+# patch FILE CMD...: run CMD (which edits FILE) and keep a timestamped backup
+# of FILE only when CMD actually changed it.
+patch() {
+  local file="$1" tmp=""
+  shift
+  if [[ -f "$file" ]]; then
+    tmp="$(mktemp)"
+    cp -p "$file" "$tmp"
+  fi
+  "$@"
+  if [[ -n "$tmp" ]]; then
+    if cmp -s "$tmp" "$file"; then
+      rm -f "$tmp"
+    else
+      local dest="$file.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
+      if [[ -e "$dest" ]]; then
+        # Already backed up this run (same second): that copy is the original.
+        rm -f "$tmp"
+      else
+        mv "$tmp" "$dest"
+        echo "  backup: $dest"
+      fi
+    fi
+  fi
 }
 
 say "Checking dependencies"
 for cmd in python3 nvim git; do
   command -v "$cmd" >/dev/null || die "'$cmd' not found in PATH"
 done
-nvim --headless -c 'if !has("nvim-0.9") | cquit | endif' -c 'qa!' 2>/dev/null \
-  || die "Neovim 0.9 or newer is required"
+nvim --headless -c 'if !has("nvim-0.10") | cquit | endif' -c 'qa!' 2>/dev/null \
+  || die "Neovim 0.10 or newer is required"
 if ((do_tmux)); then
   command -v tmux >/dev/null || die "'tmux' not found (use --no-tmux to skip)"
   tmux_ver="$(tmux -V | grep -oE '[0-9]+\.[0-9]+' | head -1)"
@@ -76,16 +100,21 @@ echo "  $CONF_DIR/inner.conf -> $REPO/tmux/inner.conf"
 
 if ((do_claude)); then
   say "Claude Code / Grok hook"
-  backup "$CLAUDE_SETTINGS"
-  "${PATCH[@]}" hooks-add "$CLAUDE_SETTINGS" "Edit|Write|MultiEdit|NotebookEdit" \
-    "$BIN_DIR/agent-edits-log Claude"
+  # PreToolUse snapshots files before the first edit; PostToolUse logs the edit.
+  for event in PreToolUse PostToolUse; do
+    patch "$CLAUDE_SETTINGS" "${PATCH[@]}" hooks-add "$CLAUDE_SETTINGS" "$event" \
+      "$CLAUDE_MATCHER" "$BIN_DIR/agent-edits-log Claude"
+  done
 fi
 
 if ((do_codex)); then
   say "Codex hook"
   if [[ -d "$(dirname "$CODEX_HOOKS")" ]]; then
-    backup "$CODEX_HOOKS"
-    "${PATCH[@]}" hooks-add "$CODEX_HOOKS" "apply_patch" "$BIN_DIR/agent-edits-log Codex"
+    for event in PreToolUse PostToolUse; do
+      patch "$CODEX_HOOKS" "${PATCH[@]}" hooks-add "$CODEX_HOOKS" "$event" \
+        "$CODEX_MATCHER" "$BIN_DIR/agent-edits-log Codex"
+    done
+    codex_notice=1
   else
     echo "  Codex not found, skipping"
   fi
@@ -95,8 +124,7 @@ if ((do_tmux)); then
   say "tmux key binding (prefix + $key)"
   tmux_conf="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
   [[ -f "$tmux_conf" || ! -f "$HOME/.tmux.conf" ]] || tmux_conf="$HOME/.tmux.conf"
-  backup "$tmux_conf"
-  "${PATCH[@]}" tmux-add "$tmux_conf" \
+  patch "$tmux_conf" "${PATCH[@]}" tmux-add "$tmux_conf" \
     "bind $key run-shell -b \"$BIN_DIR/agent-edits-popup --open $key #{q:client_name} #{q:socket_path} #{q:pane_id} #{q:pane_current_path}\""
   printf '%s\n' "$key" > "$CONF_DIR/tmux-key"
   if tmux info >/dev/null 2>&1; then
@@ -110,5 +138,10 @@ case ":$PATH:" in
 esac
 
 say "Done. Restart running agents so they load the new hook."
+if ((codex_notice)); then
+  warn "Codex only runs hooks you trust. Open Codex, run /hooks and trust the
+         agent-edits-log hooks, otherwise Codex edits are not recorded.
+         Codex asks again whenever install.sh changes the hook."
+fi
 ((do_tmux)) && echo "    Open the viewer with: <tmux prefix> $key"
 exit 0
