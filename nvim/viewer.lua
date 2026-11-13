@@ -722,6 +722,48 @@ local function send_references(first, last)
   send_text(text, false, vim.trim(text), target)
 end
 
+-- Open in an editor ----------------------------------------------------------
+-- o: new tmux window in the agent's tmux; O: split next to the agent pane.
+-- Both run $EDITOR (default nvim) at the line you are looking at.
+
+local function open_in_editor(split)
+  local e = selected()
+  if not e then return end
+  -- The cursor line in the code window; from elsewhere, the first change.
+  local line = 1
+  if vim.api.nvim_get_current_win() == M.code_win then
+    line = vim.api.nvim_win_get_cursor(M.code_win)[1]
+  elseif M.hunks[e.path] and M.hunks[e.path][1] then
+    line = M.hunks[e.path][1]
+  end
+
+  local target = agent_target()
+  if not target then
+    -- Started outside the popup: open an editable tab in this Neovim.
+    vim.cmd("tabedit " .. vim.fn.fnameescape(e.path))
+    vim.bo.modifiable, vim.bo.readonly = true, false
+    pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
+    return
+  end
+  local editor = vim.split(vim.env.VISUAL or vim.env.EDITOR or "nvim", "%s+", { trimempty = true })
+  local dir = vim.fn.fnamemodify(e.path, ":h")
+  local args = { "split-window", "-h", "-t", target.pane, "-c", dir }
+  if not split then
+    -- new-window takes a window, not a pane: the one holding the agent.
+    local window = vim.trim(vim.fn.system(outer(target,
+      { "display-message", "-p", "-t", target.pane, "#{window_id}" })))
+    args = { "new-window", "-a", "-t", window, "-c", dir }
+  end
+  vim.list_extend(args, editor)
+  vim.list_extend(args, { "+" .. line, e.path })
+  local out = vim.fn.system(outer(target, args))
+  if vim.v.shell_error ~= 0 then
+    vim.notify("agent-edits: could not open the editor: " .. vim.trim(out), vim.log.levels.ERROR)
+    return
+  end
+  hide_popup()
+end
+
 local AGENT_ORDER = { Claude = 1, Codex = 2, Grok = 3 }
 
 local function cycle_agent()
@@ -857,6 +899,8 @@ local HELP = {
   "   D                 diff: what the agent changed (toggle)",
   "   gD                diff against HEAD (toggle)",
   "   ]c / [c           next / previous change (signs in the margin)",
+  "   o                 open in $EDITOR, new tmux window, at this line",
+  "   O                 same, in a split next to the agent",
   "   Ctrl-z            hide the popup (prefix + e brings it back)",
   "   :q  ZZ  ZQ        quit the viewer",
   "",
@@ -950,6 +994,8 @@ local function setup()
   map("[f", function() move(-1) end)
   map("D", function() toggle_diff("agent") end)
   map("gD", function() toggle_diff("head") end)
+  map("o", function() open_in_editor(false) end)
+  map("O", function() open_in_editor(true) end)
   map("]c", function() jump_change(1) end)
   map("[c", function() jump_change(-1) end)
   map("<C-h>", "<cmd>wincmd h<cr>")

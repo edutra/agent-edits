@@ -117,6 +117,8 @@ is already running in the background, the same key brings it back as you left it
 | `D` | anywhere | Toggle a side-by-side diff of what the agent changed: the file before the session's first edit, next to the file now |
 | `gD` | anywhere | Toggle a side-by-side diff against `HEAD` |
 | `]c` / `[c` | anywhere | Next / previous change. Changed lines are marked in the margin (`▎` added or changed, `▁` deleted below), and the code winbar shows `+added ~changed -deleted`. |
+| `o` | anywhere | Open the file in `$VISUAL` / `$EDITOR` (default `nvim`) in a new tmux window next to the agent's. From the code window it opens at the cursor line, from the list at the first change. The popup hides itself. |
+| `O` | anywhere | Same, but in a split next to the agent pane |
 | `Ctrl-z` or `prefix + e` | anywhere | Hide the popup. The viewer keeps running. |
 | `:q`, `:qa`, `ZZ`, `ZQ` | list or code | Quit the viewer, as in plain Neovim |
 | `y` | visual selection | Paste the selected lines into the agent's prompt and keep the viewer open |
