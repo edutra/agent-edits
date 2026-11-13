@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Opens the agent-edits viewer (Neovim) for a directory.
+# Usage: agent-edits-view [DIR]   (defaults to the current directory)
+set -euo pipefail
+
+dir="${1:-$PWD}"
+root="$(cd "$dir" 2>/dev/null && pwd || pwd)"
+
+viewer="${AGENT_EDITS_VIEWER:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-edits/viewer.lua}"
+if [[ ! -r "$viewer" ]]; then
+  echo "agent-edits: viewer not found at $viewer (run install.sh)" >&2
+  read -r -n1 -s -p "Press any key..." || true
+  exit 1
+fi
+
+cd "$root"
+export AGENT_EDITS_ROOT="$root"
+exec nvim -R -u "$viewer"

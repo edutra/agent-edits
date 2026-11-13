@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""PostToolUse hook: records every file an AI agent edits.
+
+Reads the hook event (JSON) from stdin and appends one line per edited file to
+$XDG_STATE_HOME/agent-edits/edits.tsv:
+  <epoch>\t<agent>\t<absolute path>\t<project>
+where <project> is the directory the agent session was started in, so the
+viewer can show every file a project's agents touched, even outside it.
+
+Works with Claude Code (tool_name/tool_input), Grok (toolName/toolInput, also
+loads Claude's hooks) and Codex (apply_patch patch text). It never fails the
+agent: any error is swallowed and the exit code is always 0.
+"""
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "agent-edits",
+)
+LOG = os.path.join(STATE_DIR, "edits.tsv")
+PRUNE_BYTES = 1_000_000
+KEEP_SECONDS = 14 * 24 * 3600
+
+PATH_KEYS = ("file_path", "filePath", "path", "target_file", "targetFile", "notebook_path")
+PATCH_RE = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.M)
+
+
+def collect(value, found):
+    """Walk the tool input, picking explicit path keys and patch headers."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in PATH_KEYS and isinstance(item, str) and item.strip():
+                found.append(item.strip())
+            else:
+                collect(item, found)
+    elif isinstance(value, list):
+        for item in value:
+            collect(item, found)
+    elif isinstance(value, str) and "*** " in value:
+        found.extend(m.strip() for m in PATCH_RE.findall(value))
+
+
+def agent_name(event):
+    # Grok runs the hooks it finds in ~/.claude/settings.json and adds camelCase keys.
+    if "hookEventName" in event:
+        return "Grok"
+    return sys.argv[1] if len(sys.argv) > 1 else "agent"
+
+
+def project_dir(event, cwd):
+    """The directory the agent session was started in.
+
+    Not the git root: a repository higher up (e.g. a dotfiles repo in $HOME)
+    would merge unrelated projects. Grok sets CLAUDE_PROJECT_DIR to its git
+    workspace root, so its event cwd (the launch directory) is used instead.
+    """
+    if "hookEventName" in event:
+        base = event.get("cwd") or cwd
+    else:
+        base = os.environ.get("CLAUDE_PROJECT_DIR") or cwd
+    return os.path.normpath(os.path.expanduser(base))
+
+
+def prune():
+    try:
+        if os.path.getsize(LOG) < PRUNE_BYTES:
+            return
+        cutoff = time.time() - KEEP_SECONDS
+        with open(LOG, encoding="utf-8", errors="replace") as fh:
+            lines = [l for l in fh if l.split("\t", 1)[0].isdigit() and int(l.split("\t", 1)[0]) >= cutoff]
+        with open(LOG, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+    except OSError:
+        pass
+
+
+def main():
+    raw = sys.stdin.read()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.environ.get("AGENT_EDITS_DEBUG"):
+        with open(os.path.join(STATE_DIR, "debug.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(raw.strip() + "\n")
+
+    event = json.loads(raw)
+    tool_input = event.get("tool_input", event.get("toolInput"))
+    found = []
+    collect(tool_input, found)
+    if not found:
+        return
+
+    cwd = event.get("cwd") or event.get("workspaceRoot") or os.getcwd()
+    agent = agent_name(event)
+    project = project_dir(event, cwd)
+    now = int(time.time())
+    paths = []
+    for p in found:
+        p = os.path.expanduser(p)
+        if p.startswith("file://"):
+            p = p[len("file://"):]
+        p = os.path.normpath(os.path.join(cwd, p))
+        if p not in paths:
+            paths.append(p)
+
+    with open(LOG, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\n" for p in paths)
+        prune()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Runs inside the tmux popup. Keeps one viewer per directory alive in a private
+# tmux server ("tmux -L agent-edits"): the first call starts it, later calls
+# re-attach to it, so hiding the popup never loses the viewer's state.
+#
+# The tmux key binding calls it through run-shell, because display-popup does
+# not expand #{formats} in its command:
+#   agent-edits-popup --open KEY CLIENT OUTER_SOCKET PANE_ID DIR
+# which opens the popup running:
+#   agent-edits-popup KEY OUTER_SOCKET PANE_ID
+#   KEY           hides the popup again (after the prefix)
+#   OUTER_SOCKET  socket of the tmux the popup belongs to  (#{socket_path})
+#   PANE_ID       the agent's pane, where snippets are sent (#{pane_id})
+set -euo pipefail
+
+if [[ "${1:-}" == --open ]]; then
+  key="$2" client="$3" socket="$4" pane="$5" dir="$6"
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  exec tmux -S "$socket" display-popup -c "$client" -E -w 90% -h 90% -d "$dir" \
+    -T ' agent edits ' "$(printf '%q ' "$self" "$key" "$socket" "$pane")"
+fi
+
+key="${1:-e}"
+outer_socket="${2:-}"
+pane="${3:-}"
+root="$(pwd)"
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/agent-edits/inner.conf"
+server=(tmux -L agent-edits)
+[[ -r "$conf" ]] && server+=(-f "$conf")
+
+# Same prefix as the outer tmux, so "prefix + KEY" toggles the popup.
+prefix="$(tmux show-options -gv prefix 2>/dev/null || echo C-b)"
+unset TMUX
+
+session="ae-$(printf '%s' "$root" | md5sum | cut -c1-12)"
+if ! "${server[@]}" has-session -t "=$session" 2>/dev/null; then
+  "${server[@]}" new-session -d -s "$session" -c "$root" \
+    -x "$(tput cols)" -y "$(tput lines)" -e AGENT_EDITS_POPUP=1 \
+    "$here/agent-edits-view" "$root"
+fi
+"${server[@]}" set-option -g prefix "$prefix" \; bind-key "$key" detach-client
+# Where to send snippets; updated on every open, since the same viewer can be
+# brought back from another pane.
+"${server[@]}" set-option -t "$session" @ae_socket "$outer_socket" \; \
+  set-option -t "$session" @ae_pane "$pane"
+exec "${server[@]}" attach-session -t "=$session"
