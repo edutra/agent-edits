@@ -11,6 +11,11 @@ PostToolUse  appends one line per edited file to edits.tsv:
                <epoch> <agent> <path> <project> <session>
              <project> is the directory the agent session was started in.
 
+Also a maintenance command, used by the viewer:
+  agent-edits-log --clear DIR [--dry-run]   forget the edits of the project in DIR
+  agent-edits-log --clear-all [--dry-run]   forget every edit
+Both print the number of log lines removed (or that would be).
+
 Everything lives in $XDG_STATE_HOME/agent-edits. Works with Claude Code
 (tool_name/tool_input), Grok (toolName/toolInput, also loads Claude's hooks)
 and Codex (apply_patch patch text). It never fails the agent: any error is
@@ -154,7 +159,57 @@ def log_edits(event, paths, cwd):
         prune()
 
 
+def under(path, folder):
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+def in_project(path, project, root):
+    """Same rule as the viewer's project filter (nvim/viewer.lua in_project)."""
+    if under(path, root):
+        return True
+    if not project:
+        return False
+    if under(project, root):
+        return True
+    return under(root, project) and project not in (os.path.expanduser("~"), "/")
+
+
+def clear(root, dry_run):
+    """Remove log lines (all of them when root is None), then baselines of
+    sessions that no longer appear in the log. Prints the number removed."""
+    if not os.path.exists(LOG):
+        print(0)
+        return
+    root = os.path.normpath(root) if root else None
+    with open(LOG, "r+", encoding="utf-8", errors="replace") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        kept, removed = [], 0
+        for line in fh:
+            cols = line.rstrip("\n").split("\t")
+            path = cols[2] if len(cols) > 2 else ""
+            project = cols[3] if len(cols) > 3 else ""
+            if root is None or in_project(path, project, root):
+                removed += 1
+            else:
+                kept.append(line)
+        if not dry_run and removed:
+            fh.seek(0)
+            fh.writelines(kept)
+            fh.truncate()
+            sessions = {l.rstrip("\n").split("\t")[4] for l in kept if l.count("\t") >= 4}
+            if os.path.isdir(BASELINES):
+                for entry in os.scandir(BASELINES):
+                    if entry.is_dir() and entry.name not in sessions:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+    print(removed)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--clear", "--clear-all"):
+        dry_run = "--dry-run" in sys.argv
+        args = [a for a in sys.argv[2:] if a != "--dry-run"]
+        clear(args[0] if sys.argv[1] == "--clear" else None, dry_run)
+        return
     raw = sys.stdin.read()
     os.makedirs(STATE_DIR, exist_ok=True)
     if os.environ.get("AGENT_EDITS_DEBUG"):
