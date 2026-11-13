@@ -28,15 +28,30 @@ say "Removing hooks"
 
 say "Removing tmux key binding"
 key="$(cat "$CONF_DIR/tmux-key" 2>/dev/null || echo e)"
-for conf in "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf" "$HOME/.tmux.conf"; do
-  "${PATCH[@]}" tmux-remove "$conf"
-done
-if tmux info >/dev/null 2>&1 \
-  && tmux list-keys -T prefix "$key" 2>/dev/null | grep -q agent-edits-; then
-  tmux unbind-key -T prefix "$key" && echo "  unbound prefix + $key in running tmux server"
+# The file install.sh wrote to; older installs didn't record it.
+tmux_conf="$(cat "$CONF_DIR/tmux-conf" 2>/dev/null || true)"
+if [[ -z "$tmux_conf" ]]; then
+  tmux_conf="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
+  [[ -f "$tmux_conf" || ! -f "$HOME/.tmux.conf" ]] || tmux_conf="$HOME/.tmux.conf"
 fi
-if tmux -L agent-edits kill-server 2>/dev/null; then
-  echo "  closed the viewers kept in the background"
+removed=0
+if grep -qF ">>> agent-edits >>>" "$tmux_conf" 2>/dev/null; then
+  "${PATCH[@]}" tmux-remove "$tmux_conf"
+  removed=1
+else
+  echo "  no agent-edits block in $tmux_conf"
+fi
+# Touch the running tmux only when this uninstall removed the binding from
+# its config, so an uninstall against another config (tests, a second
+# XDG_CONFIG_HOME) leaves the live server alone.
+if ((removed)); then
+  if tmux info >/dev/null 2>&1 \
+    && tmux list-keys -T prefix "$key" 2>/dev/null | grep -q agent-edits-; then
+    tmux unbind-key -T prefix "$key" && echo "  unbound prefix + $key in running tmux server"
+  fi
+  if tmux -L agent-edits kill-server 2>/dev/null; then
+    echo "  closed the viewers kept in the background"
+  fi
 fi
 
 say "Removing files"

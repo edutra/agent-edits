@@ -127,6 +127,7 @@ if ((do_tmux)); then
   patch "$tmux_conf" "${PATCH[@]}" tmux-add "$tmux_conf" \
     "bind $key run-shell -b \"$BIN_DIR/agent-edits-popup --open $key #{q:client_name} #{q:socket_path} #{q:pane_id} #{q:pane_current_path}\""
   printf '%s\n' "$key" > "$CONF_DIR/tmux-key"
+  printf '%s\n' "$tmux_conf" > "$CONF_DIR/tmux-conf"
   if tmux info >/dev/null 2>&1; then
     tmux source-file "$tmux_conf" && echo "  reloaded running tmux server"
   fi
