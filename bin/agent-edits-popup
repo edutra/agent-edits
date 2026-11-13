@@ -33,7 +33,9 @@ server=(tmux -L agent-edits)
 prefix="$(tmux show-options -gv prefix 2>/dev/null || echo C-b)"
 unset TMUX
 
-session="ae-$(printf '%s' "$root" | md5sum | cut -c1-12)"
+# md5sum on Linux, md5 on macOS (which has no md5sum).
+if command -v md5sum >/dev/null; then digest=(md5sum); else digest=(md5 -q); fi
+session="ae-$(printf '%s' "$root" | "${digest[@]}" | cut -c1-12)"
 if ! "${server[@]}" has-session -t "=$session" 2>/dev/null; then
   "${server[@]}" new-session -d -s "$session" -c "$root" \
     -x "$(tput cols)" -y "$(tput lines)" -e AGENT_EDITS_POPUP=1 \

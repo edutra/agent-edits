@@ -13,10 +13,13 @@ PostToolUse  appends one line per edited file to edits.tsv:
              <project> is the directory the agent session was started in;
              <via> is "tool".
 Shell tools (Bash and friends):
-PreToolUse   notes the start time and working directory of the command.
+PreToolUse   notes the start time and working directory of the command, and
+             inside git the committed files already missing there.
 PostToolUse  logs the files under that directory modified since then, with
              <via> "shell". Inside git: modified and untracked files, ignored
-             ones excluded. Outside git: a bounded directory walk.
+             ones excluded. Outside git: a bounded directory walk. Committed
+             files the command deleted are logged too, with HEAD saved as
+             their baseline.
 
 Also a maintenance command, used by the viewer:
   agent-edits-log --clear DIR [--dry-run]   forget the edits of the project in DIR
@@ -157,9 +160,14 @@ def prune():
             lines = [l for l in fh if l.split("\t", 1)[0].isdigit() and int(l.split("\t", 1)[0]) >= cutoff]
         with open(LOG, "w", encoding="utf-8") as fh:
             fh.writelines(lines)
+        # A session still in the log keeps its baselines, however old they are:
+        # the folder's mtime only changes when a file is added to it, so a long
+        # session would otherwise lose the baselines of its first edits.
+        sessions = {l.rstrip("\n").split("\t")[4] for l in lines if l.count("\t") >= 4}
         if os.path.isdir(BASELINES):
             for entry in os.scandir(BASELINES):
-                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                if (entry.is_dir() and entry.name not in sessions
+                        and entry.stat().st_mtime < cutoff):
                     shutil.rmtree(entry.path, ignore_errors=True)
         if os.path.isdir(PENDING):
             # Shell calls whose PostToolUse never came (denied, interrupted).
@@ -199,27 +207,63 @@ def pending_file(event):
     return os.path.join(PENDING, name)
 
 
+def git_paths(workdir, args):
+    """Absolute paths a git command prints (NUL separated, relative to
+    workdir), or None outside git. A directory ignored by an enclosing
+    repository (e.g. a project inside a dotfiles repo) counts as outside."""
+    try:
+        out = subprocess.run(["git", "-C", workdir] + args, capture_output=True, timeout=3)
+        if out.returncode != 0:
+            return None
+        if subprocess.run(["git", "-C", workdir, "check-ignore", "-q", "."],
+                          capture_output=True, timeout=3).returncode == 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return [os.path.normpath(os.path.join(workdir, p.decode(errors="surrogateescape")))
+            for p in out.stdout.split(b"\0") if p]
+
+
+def deleted_files(workdir):
+    """Files under workdir that are in HEAD but gone from the disk (also after
+    a git rm), or None outside git or before the first commit."""
+    return git_paths(workdir, ["diff", "HEAD", "--relative", "--no-renames", "--name-only",
+                               "--diff-filter=D", "-z", "--", "."])
+
+
+def save_head_baselines(session, workdir, paths):
+    """Baselines for files a shell command deleted under workdir: their
+    committed version (the file as it was just before the command is gone).
+    git runs in workdir, since the file's own directory may be gone too."""
+    if session == "-":
+        return
+    folder = os.path.join(BASELINES, session)
+    os.makedirs(folder, exist_ok=True)
+    for path in paths:
+        base = os.path.join(folder, baseline_key(path))
+        if any(os.path.exists(base + ext) for ext in ("", ".new", ".skip")):
+            continue
+        try:
+            out = subprocess.run(
+                ["git", "-C", workdir, "show", "HEAD:./" + os.path.relpath(path, workdir)],
+                capture_output=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode != 0:
+            continue
+        if len(out.stdout) > MAX_BASELINE_BYTES:
+            open(base + ".skip", "w").close()
+            continue
+        with open(base + ".tmp", "wb") as fh:
+            fh.write(out.stdout)
+        os.replace(base + ".tmp", base)
+
+
 def changed_since(workdir, start_ns):
     """Files under workdir modified at or after start_ns (nanoseconds)."""
-    candidates = []
-    try:
-        out = subprocess.run(
-            ["git", "-C", workdir, "ls-files", "-m", "-o", "--exclude-standard", "-z", "--", "."],
-            capture_output=True, timeout=3,
-        )
-        in_git = out.returncode == 0
-        if in_git:
-            # A directory ignored by an enclosing repository (e.g. a project
-            # inside a dotfiles repo) would list nothing: walk it instead.
-            in_git = subprocess.run(["git", "-C", workdir, "check-ignore", "-q", "."],
-                                    capture_output=True, timeout=3).returncode != 0
-    except (OSError, subprocess.SubprocessError):
-        in_git = False
-    if in_git:
-        # ls-files prints paths relative to workdir.
-        candidates = [os.path.join(workdir, p.decode(errors="surrogateescape"))
-                      for p in out.stdout.split(b"\0") if p]
-    else:
+    candidates = git_paths(workdir, ["ls-files", "-m", "-o", "--exclude-standard", "-z", "--", "."])
+    if candidates is None:
+        candidates = []
         deadline, seen = time.monotonic() + WALK_SECONDS, 0
         stack = [workdir]
         while stack and seen < WALK_LIMIT and time.monotonic() < deadline:
@@ -250,16 +294,29 @@ def handle_shell(event, cwd):
     marker = pending_file(event)
     if event_name(event) == "PreToolUse":
         os.makedirs(PENDING, exist_ok=True)
-        with open(marker, "w", encoding="utf-8") as fh:
-            fh.write(f"{time.time_ns()}\t{shell_workdir(event, cwd)}\n")
+        workdir = shell_workdir(event, cwd)
+        start = time.time_ns()
+        # Marker: "<start>\t<workdir>\n", then, inside git, the files already
+        # deleted, NUL separated.
+        missing = deleted_files(workdir)
+        with open(marker, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(f"{start}\t{workdir}\n")
+            if missing is not None:
+                fh.write("\0".join(["git"] + missing))
         return
     try:
-        with open(marker, encoding="utf-8") as fh:
-            start, _, workdir = fh.read().rstrip("\n").partition("\t")
+        with open(marker, encoding="utf-8", errors="surrogateescape") as fh:
+            head, _, rest = fh.read().partition("\n")
         os.remove(marker)
     except OSError:
         return
+    start, _, workdir = head.partition("\t")
     paths = changed_since(workdir, int(start))
+    if rest.startswith("git"):
+        before = set(rest.split("\0")[1:])
+        gone = [p for p in deleted_files(workdir) or [] if p not in before]
+        save_head_baselines(session_id(event), workdir, gone)
+        paths += gone[:MAX_SHELL_FILES]
     if paths:
         log_edits(event, paths, cwd, via="shell")
 

@@ -153,9 +153,15 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
   `node_modules`, `.venv` and hidden directories). Such edits are marked `$` (`Claude$`). A file
   something else changed during the command (your editor, another agent) can show up too.
   `D` shows them against `HEAD`, because no snapshot is taken before a command.
+  Inside git, committed files a command deletes (`rm`, `git rm`) are recorded too, with their
+  `HEAD` version as the snapshot. Deleting untracked files, or files outside git, is not seen.
 - Only edits made after you install the hook are recorded.
 - `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
-- Files that no longer exist are hidden. Log entries older than 14 days are pruned once the log grows past about 1 MB.
+- A file that no longer exists stays in the list, struck through and marked `✗`, when there is a
+  snapshot of what it held: `D` shows it. Files an agent created and then removed again
+  (scratch files) are hidden.
+- Log entries older than 14 days are pruned once the log grows past about 1 MB. Snapshots are
+  kept as long as their session is still in the log.
   `:AgentEditsClear` clears the history at any time.
 
 ## Troubleshooting
