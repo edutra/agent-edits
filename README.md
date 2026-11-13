@@ -36,7 +36,8 @@ agent's prompt.
    viewer per directory alive in a private tmux server (`tmux -L agent-edits`). The first press
    starts the viewer, and later presses re-attach to it, so hiding the popup keeps its state.
 3. `agent-edits-view` starts Neovim with `nvim/viewer.lua` in that directory. Every logged file
-   is listed. Files under the directory show a relative path, and all others show a `~/...` path.
+   is listed, and you can filter the list by agent, session or project. A path is shown relative
+   to the editing session's project, or to the directory, or as `~/...`.
    The list refreshes every 2 seconds.
 4. The binding also passes the pane's id to the viewer. Selected code is pasted into that pane
    with `tmux paste-buffer -p` (bracketed paste), so the newlines don't submit the prompt.
@@ -99,6 +100,10 @@ is already running in the background, the same key brings it back as you left it
 | `j` / `k`, `gg` / `G` | list | Select a file (the preview updates) |
 | `Enter` / `l` | list | Jump into the code |
 | `r` | list | Reload the list now |
+| `a` | list | Filter by agent: all, Claude, Codex, Grok (only the agents in the log) |
+| `s` | list | Show only the session that edited the selected file (toggle) |
+| `p` | list | Show only this project (toggle): files under the directory, or edited by a session started in it, above it or below it |
+| `F` | list | Clear the filters |
 | `]f` / `[f` | anywhere | Next / previous edited file |
 | `Ctrl-h` / `Ctrl-l` | anywhere | Move between the list and the code |
 | `D` | anywhere | Toggle a side-by-side diff of what the agent changed: the file before the session's first edit, next to the file now |

@@ -34,11 +34,16 @@ local function under(path, dir)
   return path == dir or path:sub(1, #dir + 1) == dir .. "/"
 end
 
--- Every logged file is listed, from any project. Files under the directory
--- the viewer was opened in show a relative path; the rest show ~/...
-local function display_name(path)
-  if root ~= "/" and path ~= root and under(path, root) then
-    return path:sub(#root + 2)
+-- Every logged file is listed, from any project. A file shows a path relative
+-- to the project of the session that edited it, else to the directory the
+-- viewer was opened in, else ~/... A session started in $HOME or / has no
+-- project worth naming.
+local function display_name(path, project)
+  if project == vim.env.HOME or project == "/" then project = "" end
+  for _, base in ipairs({ project or "", root }) do
+    if base ~= "" and base ~= "/" and path ~= base and under(path, base) then
+      return path:sub(#base + 2)
+    end
   end
   return vim.fn.fnamemodify(path, ":~")
 end
@@ -54,7 +59,7 @@ local function read_entries()
       if ts and path and path ~= "" then
         if not latest[path] or latest[path].ts <= ts then
           latest[path] = {
-            ts = ts, agent = f[2], path = path, rel = display_name(path),
+            ts = ts, agent = f[2], path = path, rel = display_name(path, f[4]),
             project = f[4] or "", session = f[5] or "-",
           }
         end
@@ -73,6 +78,43 @@ local function read_entries()
     return a.ts > b.ts
   end)
   return list
+end
+
+-- Filters ------------------------------------------------------------------
+-- a: one agent; s: the session of the selected file; p: this project only.
+
+local home = vim.env.HOME
+M.filters = { agent = nil, session = nil, project = false }
+
+-- "This project": the file is under the viewer's directory, or the session
+-- that edited it was started in that directory, below it, or above it
+-- (except $HOME and /, which are not projects).
+local function in_project(e)
+  if under(e.path, root) then return true end
+  local project = e.project or ""
+  if project == "" then return false end
+  if under(project, root) then return true end
+  return under(root, project) and project ~= home and project ~= "/"
+end
+
+local function apply_filters(all)
+  local f, out = M.filters, {}
+  for _, e in ipairs(all) do
+    if (not f.agent or e.agent == f.agent)
+      and (not f.session or e.session == f.session)
+      and (not f.project or in_project(e)) then
+      out[#out + 1] = e
+    end
+  end
+  return out
+end
+
+local function filter_labels()
+  local f, out = M.filters, {}
+  if f.agent then out[#out + 1] = f.agent end
+  if f.session then out[#out + 1] = "sess:" .. f.session:sub(1, 6) end
+  if f.project then out[#out + 1] = "project" end
+  return out
 end
 
 local function selected()
@@ -122,8 +164,11 @@ end
 
 local function render()
   local lines = {}
-  if #M.entries == 0 then
-    lines = { "", "  No files edited by agents", "  under this directory yet." }
+  if #M.entries == 0 and #filter_labels() > 0 then
+    lines = { "", "  No files match the filters:", "  " .. table.concat(filter_labels(), " "),
+      "", "  F clears them." }
+  elseif #M.entries == 0 then
+    lines = { "", "  No files edited by agents yet." }
   else
     for _, e in ipairs(M.entries) do
       local suffix = string.format(" %s %s", e.agent, ago(e.ts))
@@ -138,12 +183,16 @@ local function render()
   vim.bo[M.list_buf].modifiable = true
   vim.api.nvim_buf_set_lines(M.list_buf, 0, -1, false, lines)
   vim.bo[M.list_buf].modifiable = false
-  vim.wo[M.list_win].winbar = string.format(" Agent edits (%d)  %%#Comment#%s", #M.entries,
-    vim.fn.fnamemodify(root, ":t"))
+  local count = #M.entries == M.total and tostring(M.total) or (#M.entries .. "/" .. M.total)
+  local labels = table.concat(filter_labels(), " ")
+  vim.wo[M.list_win].winbar = string.format(" Edits (%s)  %%#Comment#%s", count,
+    labels ~= "" and labels or vim.fn.fnamemodify(root, ":t"))
 end
 
 local function refresh(force)
-  local entries = read_entries()
+  local all = read_entries()
+  local entries = apply_filters(all)
+  M.total, M.all = #all, all
   local sig = {}
   for _, e in ipairs(entries) do sig[#sig + 1] = e.ts .. e.path end
   sig = table.concat(sig, "\n")
@@ -380,6 +429,50 @@ local function send_selection(hide)
   end
 end
 
+local AGENT_ORDER = { Claude = 1, Codex = 2, Grok = 3 }
+
+local function cycle_agent()
+  local seen, agents = {}, {}
+  for _, e in ipairs(M.all or {}) do
+    if not seen[e.agent] then seen[e.agent] = true agents[#agents + 1] = e.agent end
+  end
+  table.sort(agents, function(x, y)
+    local ox, oy = AGENT_ORDER[x] or 99, AGENT_ORDER[y] or 99
+    if ox == oy then return x < y end
+    return ox < oy
+  end)
+  local nxt = agents[1]
+  for i, a in ipairs(agents) do
+    if a == M.filters.agent then nxt = agents[i + 1] break end
+  end
+  M.filters.agent = nxt
+  refresh(true)
+end
+
+local function toggle_session()
+  if M.filters.session then
+    M.filters.session = nil
+  else
+    local e = selected()
+    if not e or e.session == "-" then
+      vim.notify("agent-edits: no session recorded for this file")
+      return
+    end
+    M.filters.session = e.session
+  end
+  refresh(true)
+end
+
+local function toggle_project()
+  M.filters.project = not M.filters.project
+  refresh(true)
+end
+
+local function clear_filters()
+  M.filters = { agent = nil, session = nil, project = false }
+  refresh(true)
+end
+
 local HELP = {
   " agent-edits  ·  :AgentEditsHelp or g?",
   "",
@@ -387,6 +480,10 @@ local HELP = {
   "   j / k, gg / G     select a file (the preview follows)",
   "   Enter / l         jump into the code",
   "   r                 reload the list now",
+  "   a                 filter by agent: all, Claude, Codex, Grok",
+  "   s                 only the session of the selected file (toggle)",
+  "   p                 only this project (toggle)",
+  "   F                 clear the filters",
   "",
   " Anywhere",
   "   ]f / [f           next / previous edited file",
@@ -450,6 +547,10 @@ local function setup()
   map("<CR>", function() vim.api.nvim_set_current_win(M.code_win) end, lb)
   map("l", function() vim.api.nvim_set_current_win(M.code_win) end, lb)
   map("r", function() refresh(true) end, lb)
+  map("a", cycle_agent, lb)
+  map("s", toggle_session, lb)
+  map("p", toggle_project, lb)
+  map("F", clear_filters, lb)
 
   -- Global keys (every window, including the code and diff windows).
   map("]f", function() move(1) end)
