@@ -26,6 +26,7 @@ agent's prompt.
    - **Grok**: Grok also loads the hooks in `~/.claude/settings.json`, so the same entry covers it.
      Edits are tagged `Grok`.
    - **Codex**: `apply_patch` (in `~/.codex/hooks.json`). File names are read from the patch.
+     Codex runs the hook only after you trust it with `/hooks` (see Troubleshooting).
 2. The tmux binding runs `agent-edits-popup --open` through `run-shell`, because `display-popup`
    does not expand `#{formats}` in its command. That opens a `display-popup` running `agent-edits-popup`. That script keeps one
    viewer per directory alive in a private tmux server (`tmux -L agent-edits`). The first press
@@ -78,7 +79,8 @@ The installer:
   ```
 - saves a timestamped backup (`*.bak-agent-edits-YYYYmmdd-HHMMSS`) of each config file before it changes the file.
 
-Running `./install.sh` again is safe: it never adds an entry twice.
+Running `./install.sh` again is safe: it never adds an entry twice, and it updates an existing
+entry in place, so upgrading is `git pull && ./install.sh`. It backs a file up only when it changes the file.
 
 Environment overrides: `AGENT_EDITS_BIN_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`.
@@ -130,6 +132,8 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
 
 - **The list is empty.** Check `~/.local/state/agent-edits/edits.tsv`. If it is empty, restart the agent so
   it loads the hook. In Claude Code, `/hooks` lists the hooks it loaded.
+- **Codex edits don't show up.** Codex only runs hooks that you trust. Open Codex, run `/hooks`
+  and trust the `agent-edits-log` hooks. Codex asks again when `install.sh` changes a hook.
 - **An agent sends a payload the logger doesn't parse.** Start the agent with `AGENT_EDITS_DEBUG=1`
   set. Each raw hook event is then written to `~/.local/state/agent-edits/debug.jsonl`.
   Please open an issue with an example.

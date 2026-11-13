@@ -10,8 +10,13 @@ CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 CODEX_HOOKS="${CODEX_HOME:-$HOME/.codex}/hooks.json"
 PATCH=(python3 "$REPO/lib/config_patch.py")
 
+# Tools whose calls the hook logs, per agent. Grok reads Claude's settings and
+# maps Claude's tool names to its own.
+CLAUDE_MATCHER="Edit|Write|MultiEdit|NotebookEdit"
+CODEX_MATCHER="apply_patch|Edit|Write"
+
 key="e"
-do_claude=1 do_codex=1 do_tmux=1
+do_claude=1 do_codex=1 do_tmux=1 codex_notice=0
 
 usage() {
   cat <<EOF
@@ -41,12 +46,25 @@ say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-backup() {
-  [[ -f "$1" ]] || return 0
-  local dest
-  dest="$1.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
-  cp -p "$1" "$dest"
-  echo "  backup: $dest"
+# patch FILE CMD...: run CMD (which edits FILE) and keep a timestamped backup
+# of FILE only when CMD actually changed it.
+patch() {
+  local file="$1" tmp=""
+  shift
+  if [[ -f "$file" ]]; then
+    tmp="$(mktemp)"
+    cp -p "$file" "$tmp"
+  fi
+  "$@"
+  if [[ -n "$tmp" ]]; then
+    if cmp -s "$tmp" "$file"; then
+      rm -f "$tmp"
+    else
+      local dest="$file.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
+      mv "$tmp" "$dest"
+      echo "  backup: $dest"
+    fi
+  fi
 }
 
 say "Checking dependencies"
@@ -76,16 +94,16 @@ echo "  $CONF_DIR/inner.conf -> $REPO/tmux/inner.conf"
 
 if ((do_claude)); then
   say "Claude Code / Grok hook"
-  backup "$CLAUDE_SETTINGS"
-  "${PATCH[@]}" hooks-add "$CLAUDE_SETTINGS" "Edit|Write|MultiEdit|NotebookEdit" \
-    "$BIN_DIR/agent-edits-log Claude"
+  patch "$CLAUDE_SETTINGS" "${PATCH[@]}" hooks-add "$CLAUDE_SETTINGS" PostToolUse \
+    "$CLAUDE_MATCHER" "$BIN_DIR/agent-edits-log Claude"
 fi
 
 if ((do_codex)); then
   say "Codex hook"
   if [[ -d "$(dirname "$CODEX_HOOKS")" ]]; then
-    backup "$CODEX_HOOKS"
-    "${PATCH[@]}" hooks-add "$CODEX_HOOKS" "apply_patch" "$BIN_DIR/agent-edits-log Codex"
+    patch "$CODEX_HOOKS" "${PATCH[@]}" hooks-add "$CODEX_HOOKS" PostToolUse \
+      "$CODEX_MATCHER" "$BIN_DIR/agent-edits-log Codex"
+    codex_notice=1
   else
     echo "  Codex not found, skipping"
   fi
@@ -95,8 +113,7 @@ if ((do_tmux)); then
   say "tmux key binding (prefix + $key)"
   tmux_conf="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
   [[ -f "$tmux_conf" || ! -f "$HOME/.tmux.conf" ]] || tmux_conf="$HOME/.tmux.conf"
-  backup "$tmux_conf"
-  "${PATCH[@]}" tmux-add "$tmux_conf" \
+  patch "$tmux_conf" "${PATCH[@]}" tmux-add "$tmux_conf" \
     "bind $key run-shell -b \"$BIN_DIR/agent-edits-popup --open $key #{q:client_name} #{q:socket_path} #{q:pane_id} #{q:pane_current_path}\""
   printf '%s\n' "$key" > "$CONF_DIR/tmux-key"
   if tmux info >/dev/null 2>&1; then
@@ -110,5 +127,10 @@ case ":$PATH:" in
 esac
 
 say "Done. Restart running agents so they load the new hook."
+if ((codex_notice)); then
+  warn "Codex only runs hooks you trust. Open Codex, run /hooks and trust the
+         agent-edits-log hooks, otherwise Codex edits are not recorded.
+         Codex asks again whenever install.sh changes the hook."
+fi
 ((do_tmux)) && echo "    Open the viewer with: <tmux prefix> $key"
 exit 0
