@@ -10,6 +10,7 @@ end
 local root = (vim.env.AGENT_EDITS_ROOT or vim.fn.getcwd()):gsub("(.)/$", "%1")
 local state_dir = (vim.env.XDG_STATE_HOME or (vim.env.HOME .. "/.local/state")) .. "/agent-edits"
 local log_file = state_dir .. "/edits.tsv"
+local baselines_dir = state_dir .. "/baselines"
 local LIST_WIDTH = 40
 
 vim.o.swapfile = false
@@ -47,12 +48,15 @@ local function read_entries()
   local fh = io.open(log_file, "r")
   if fh then
     for line in fh:lines() do
-      -- <epoch> <agent> <path> [<project>]; old lines have no project column.
-      local ts, agent, path = line:match("^(%d+)\t([^\t]*)\t([^\t]+)")
-      if ts then
-        ts = tonumber(ts)
+      -- <epoch> <agent> <path> [<project> [<session> ...]]; older lines have fewer columns.
+      local f = vim.split(line, "\t", { plain = true })
+      local ts, path = tonumber(f[1]), f[3]
+      if ts and path and path ~= "" then
         if not latest[path] or latest[path].ts <= ts then
-          latest[path] = { ts = ts, agent = agent, path = path, rel = display_name(path) }
+          latest[path] = {
+            ts = ts, agent = f[2], path = path, rel = display_name(path),
+            project = f[4] or "", session = f[5] or "-",
+          }
         end
       end
     end
@@ -79,10 +83,13 @@ end
 
 local function diff_off()
   if not M.diff_win then return end
-  if vim.api.nvim_win_is_valid(M.diff_win) then
-    vim.api.nvim_win_close(M.diff_win, true)
-  end
+  -- Forget the window before closing it, so the WinClosed handler (meant for
+  -- a :q on the diff window) doesn't schedule a diffoff over a new diff.
+  local win = M.diff_win
   M.diff_win = nil
+  if vim.api.nvim_win_is_valid(win) then
+    vim.api.nvim_win_close(win, true)
+  end
   if vim.api.nvim_win_is_valid(M.code_win) then
     vim.api.nvim_win_call(M.code_win, function() vim.cmd("diffoff") end)
   end
@@ -160,21 +167,57 @@ local function move(delta)
   preview(M.entries[row])
 end
 
-local function toggle_diff()
+-- The file as committed in HEAD, from the repository that holds it.
+local function head_lines(path)
+  local dir, name = vim.fn.fnamemodify(path, ":h"), vim.fn.fnamemodify(path, ":t")
+  local out = vim.fn.systemlist({ "git", "-C", dir, "show", "HEAD:./" .. name })
+  if vim.v.shell_error ~= 0 then return nil end
+  return out
+end
+
+-- The file as it was before the session that last edited it touched it, saved
+-- by the hook. Returns lines (empty for a file the session created) and a
+-- label, or nil when there is no usable baseline.
+local function baseline_lines(e)
+  if not e.session or e.session == "-" then return nil end
+  local base = baselines_dir .. "/" .. e.session .. "/" .. vim.fn.sha256(e.path)
+  local label = string.format("before %s (%s)", e.agent, e.session:sub(1, 8))
+  if vim.uv.fs_stat(base .. ".new") then return {}, label .. ", new file" end
+  if not vim.uv.fs_stat(base) then return nil end
+  return vim.fn.readfile(base), label
+end
+
+-- Lines to compare the file with. kind "agent": the session's baseline, else
+-- HEAD; kind "head": HEAD only. Returns lines and a label, or nil and a reason.
+local function base_for(e, kind)
+  if kind == "agent" then
+    local lines, label = baseline_lines(e)
+    if lines then return lines, label end
+  end
+  local lines = head_lines(e.path)
+  if lines then
+    return lines, kind == "agent" and "HEAD (no snapshot of the agent's starting point)" or "HEAD"
+  end
+  if kind == "agent" then
+    return nil, "no snapshot of the agent's starting point and no committed version"
+  end
+  return nil, "no committed version (new file, no commits yet or not in git)"
+end
+
+local function toggle_diff(kind)
   local e = selected()
   if not e then return end
   if M.diff_win then
+    local same = M.diff_kind == kind
     diff_off()
+    if same then return end
+  end
+  local out, label = base_for(e, kind)
+  if not out then
+    vim.notify("agent-edits: " .. label, vim.log.levels.WARN)
     return
   end
-  -- Ask the repository that holds the file, wherever it is.
-  local dir, name = vim.fn.fnamemodify(e.path, ":h"), vim.fn.fnamemodify(e.path, ":t")
-  local out = vim.fn.systemlist({ "git", "-C", dir, "show", "HEAD:./" .. name })
-  if vim.v.shell_error ~= 0 then
-    vim.notify("agent-edits: no committed version (new file, no commits yet or not in git)",
-      vim.log.levels.WARN)
-    return
-  end
+  M.diff_kind = kind
   local ft = vim.bo[vim.api.nvim_win_get_buf(M.code_win)].filetype
   vim.api.nvim_set_current_win(M.code_win)
   vim.cmd("diffthis")
@@ -186,7 +229,7 @@ local function toggle_diff()
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].modifiable = false
   vim.bo[buf].filetype = ft
-  vim.wo[M.diff_win].winbar = " HEAD:" .. e.rel
+  vim.wo[M.diff_win].winbar = " %#Comment#" .. label:gsub("%%", "%%%%")
   vim.cmd("diffthis")
   vim.api.nvim_set_current_win(M.code_win)
 end
@@ -264,7 +307,8 @@ local HELP = {
   " Anywhere",
   "   ]f / [f           next / previous edited file",
   "   Ctrl-h / Ctrl-l   move between list and code",
-  "   D                 toggle diff against HEAD",
+  "   D                 diff: what the agent changed (toggle)",
+  "   gD                diff against HEAD (toggle)",
   "   Ctrl-z            hide the popup (prefix + e brings it back)",
   "   :q  ZZ  ZQ        quit the viewer",
   "",
@@ -325,7 +369,8 @@ local function setup()
   -- Global keys (every window, including the code and diff windows).
   map("]f", function() move(1) end)
   map("[f", function() move(-1) end)
-  map("D", toggle_diff)
+  map("D", function() toggle_diff("agent") end)
+  map("gD", function() toggle_diff("head") end)
   map("<C-h>", "<cmd>wincmd h<cr>")
   map("<C-l>", "<cmd>wincmd l<cr>")
 

@@ -19,8 +19,8 @@ edit, next to the file now.
 - On `PreToolUse`, for each path the tool is about to touch, if the session has no
   baseline for that path yet:
   - the file exists and is at most 2 MB: copy it to
-    `baselines/<session>/<sha1(path)>`.
-  - the file does not exist: write an empty `<sha1(path)>.new` marker (the agent
+    `baselines/<session>/<sha256(path)>`.
+  - the file does not exist: write an empty `<sha256(path)>.new` marker (the agent
     creates the file).
   - it is larger than 2 MB: write a `.skip` marker, and the viewer falls back to `HEAD`.
 - The baseline is kept for the whole session. Later edits in the same session never

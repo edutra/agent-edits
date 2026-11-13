@@ -19,9 +19,13 @@ agent's prompt.
 
 ## How it works
 
-1. A `PostToolUse` hook (`agent-edits-log`) runs after each file-editing tool call and appends
-   `timestamp  agent  absolute-path  project` to `~/.local/state/agent-edits/edits.tsv`.
-   `project` is the directory the agent session was started in.
+1. The `agent-edits-log` hook runs around each file-editing tool call:
+   - **before** the call (`PreToolUse`), it saves a copy of each file the tool is about to change.
+     It does this once per agent session, in `~/.local/state/agent-edits/baselines/`. `D` uses
+     this copy to show exactly what the session changed.
+   - **after** the call (`PostToolUse`), it appends `timestamp  agent  path  project  session`
+     to `~/.local/state/agent-edits/edits.tsv`. `project` is the directory the agent session was
+     started in.
    - **Claude Code**: `Edit`, `Write`, `MultiEdit`, `NotebookEdit` (in `~/.claude/settings.json`).
    - **Grok**: Grok also loads the hooks in `~/.claude/settings.json`, so the same entry covers it.
      Edits are tagged `Grok`.
@@ -45,7 +49,7 @@ The hook never blocks or fails an agent. It always exits with code 0.
 - `python3` (3.8 or newer)
 - Neovim 0.9 or newer
 - tmux 3.3 or newer (for `display-popup`)
-- git (optional, only for the `D` diff view)
+- git (optional, for `gD` and as a fallback for `D`)
 
 ## Installation
 
@@ -97,7 +101,8 @@ is already running in the background, the same key brings it back as you left it
 | `r` | list | Reload the list now |
 | `]f` / `[f` | anywhere | Next / previous edited file |
 | `Ctrl-h` / `Ctrl-l` | anywhere | Move between the list and the code |
-| `D` | anywhere | Toggle a side-by-side diff against `HEAD` |
+| `D` | anywhere | Toggle a side-by-side diff of what the agent changed: the file before the session's first edit, next to the file now |
+| `gD` | anywhere | Toggle a side-by-side diff against `HEAD` |
 | `Ctrl-z` or `prefix + e` | anywhere | Hide the popup. The viewer keeps running. |
 | `:q`, `:qa`, `ZZ`, `ZQ` | list or code | Quit the viewer, as in plain Neovim |
 | `y` | visual selection | Paste the selected lines into the agent's prompt and keep the viewer open |
@@ -126,6 +131,7 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
 - Only edits made through the agents' file-editing tools are recorded. Changes made with shell
   commands (`sed -i`, `echo > file`, code generators) are not.
 - Only edits made after you install the hook are recorded.
+- `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
 - Files that no longer exist are hidden. Log entries older than 14 days are pruned once the log grows past about 1 MB.
 
 ## Troubleshooting
