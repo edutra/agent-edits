@@ -25,6 +25,8 @@ vim.o.number = true
 vim.o.signcolumn = "no"
 
 local M = { entries = {}, signature = "", list_buf = nil, list_win = nil, code_win = nil, current = nil }
+-- The viewer's state, for tests/viewer.
+package.loaded["agent-edits"] = M
 
 local function ago(ts)
   local d = os.time() - ts

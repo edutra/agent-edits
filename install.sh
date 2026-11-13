@@ -47,12 +47,17 @@ say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Files this run created ("|file|..."): they had nothing worth a backup.
+created="|"
+
 # patch FILE CMD...: run CMD (which edits FILE) and keep a timestamped backup
 # of FILE only when CMD actually changed it.
 patch() {
   local file="$1" tmp=""
   shift
-  if [[ -f "$file" ]]; then
+  if [[ ! -e "$file" ]]; then
+    created+="$file|"
+  elif [[ "$created" != *"|$file|"* ]]; then
     tmp="$(mktemp)"
     cp -p "$file" "$tmp"
   fi
@@ -61,7 +66,8 @@ patch() {
     if cmp -s "$tmp" "$file"; then
       rm -f "$tmp"
     else
-      local dest="$file.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
+      local dest
+      dest="$file.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
       if [[ -e "$dest" ]]; then
         # Already backed up this run (same second): that copy is the original.
         rm -f "$tmp"

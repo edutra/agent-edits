@@ -1,0 +1,1 @@
+{"sessionId": "grok-session-1", "cwd": "@CWD@", "workspaceRoot": "@CWD@", "hookEventName": "@GROK_EVENT@", "toolName": "Edit", "toolInput": {"filePath": "@FILE@", "oldString": "one", "newString": "two"}, "toolUseId": "grok_01"}

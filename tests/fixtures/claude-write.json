@@ -1,0 +1,1 @@
+{"session_id": "claude-session-1", "cwd": "@CWD@", "hook_event_name": "@EVENT@", "tool_name": "Write", "tool_input": {"file_path": "@FILE@", "content": "hello\n"}, "tool_use_id": "toolu_02"}
