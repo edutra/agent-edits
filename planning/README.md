@@ -16,9 +16,17 @@ One planning document per task. Each task is implemented in its own branch, crea
 | 8 | Mark files as reviewed | `feature/review-marks` | [08-review-marks.md](08-review-marks.md) |
 | 10 | Detect edits made by shell commands | `feature/shell-edits` | [10-shell-edits.md](10-shell-edits.md) |
 | 11 | Open the file in a regular editor | `feature/open-in-editor` | [11-open-in-editor.md](11-open-in-editor.md) |
+| 12 | Robustness fixes (macOS, refresh cost, deleted files, baseline prune) | `fix/robustness` | [12-robustness.md](12-robustness.md) |
+| 13 | Automated tests and CI | `chore/tests` | [13-tests-ci.md](13-tests-ci.md) |
+| 14 | Revert to the agent's starting point | `feature/revert` | [14-revert-to-baseline.md](14-revert-to-baseline.md) |
+| 15 | Export a session as a patch | `feature/session-patch` | [15-session-patch.md](15-session-patch.md) |
+| 16 | Baselines for shell edits | `feature/shell-baselines` | [16-shell-baselines.md](16-shell-baselines.md) |
+| 17 | Batched review comments | `feature/review-batch` | [17-review-batch.md](17-review-batch.md) |
+| 9 | tmux status counter and notifications | `feature/status-counter` | [09-status-counter.md](09-status-counter.md) |
+| 18 | More agents (Gemini CLI, Cursor CLI, opencode) | `feature/more-agents` | [18-more-agents.md](18-more-agents.md) |
 
-Task 9 (tmux status counter and notifications) and task 12 (demo GIF, tests, more
-agents) are not scheduled.
+The rows are in the planned order. Tests (13) come first among the new tasks, so every
+feature after it lands with tests. A demo GIF for the README is not scheduled.
 
 ## Shared decisions
 
@@ -36,7 +44,9 @@ viewer. Every column is appended at the end, so old lines stay readable:
 | 5 | task 1 | Agent session id (`-` when unknown) |
 | 6 | task 10 | How the edit was detected: `tool` (an edit tool) or `shell` (a shell command) |
 
-Other state lives next to the log: `baselines/` (task 1) and `reviewed.tsv` (task 8).
+Other state lives next to the log: `baselines/` (task 1), `reviewed.tsv` (task 8),
+`pending/` (task 10), and later `reverted/` (task 14), `review.json` (task 17) and
+`count-*` (task 9).
 
 ### Key map
 
@@ -59,6 +69,12 @@ The keys are planned together so that the features don't collide.
 | `X` | list | hide / show reviewed files | 8 |
 | `o` | anywhere | open the file in a new tmux window | 11 |
 | `O` | anywhere | open the file in a split next to the agent | 11 |
+| `R` | code / list | revert the hunk / the file(s) to the agent's starting point | 14 |
+| `:AgentEditsUndoRevert` | command | undo the last revert | 14 |
+| `:AgentEditsPatch[!] [file]` | command | the selected file's session as a patch (`!`: send it to the agent) | 15 |
+| `C` | visual | add a comment to the review queue | 17 |
+| `S` | anywhere | send the queued review | 17 |
+| `:AgentEditsReview` | command | show and edit the review queue | 17 |
 
 Every task updates `g?` / `:AgentEditsHelp` and the README key table.
 
