@@ -11,6 +11,10 @@ local root = (vim.env.AGENT_EDITS_ROOT or vim.fn.getcwd()):gsub("(.)/$", "%1")
 local state_dir = (vim.env.XDG_STATE_HOME or (vim.env.HOME .. "/.local/state")) .. "/agent-edits"
 local log_file = state_dir .. "/edits.tsv"
 local baselines_dir = state_dir .. "/baselines"
+-- The hook script next to this file (nvim/viewer.lua -> bin/agent-edits-log).
+local this_file = vim.fn.resolve(debug.getinfo(1, "S").source:sub(2))
+local log_cmd = vim.fn.fnamemodify(this_file, ":h:h") .. "/bin/agent-edits-log"
+if vim.fn.executable(log_cmd) == 0 then log_cmd = vim.fn.exepath("agent-edits-log") end
 local LIST_WIDTH = 40
 
 vim.o.swapfile = false
@@ -108,12 +112,57 @@ local function in_project(e)
   return under(root, project) and project ~= home and project ~= "/"
 end
 
+-- Hide committed files (H) ----------------------------------------------------
+-- A file is "committed" when it is in a git repository and git status reports
+-- nothing for it: tracked, unchanged since HEAD. Untracked, ignored and
+-- non-git files always stay visible.
+
+M.hide_committed = false
+
+-- Set of absolute paths of committed files among `entries`, plus a signature
+-- of the git state, so a commit refreshes the list.
+local function committed_files(entries)
+  local tops, by_dir, clean, sig = {}, {}, {}, {}
+  for _, e in ipairs(entries) do
+    local dir = vim.fn.fnamemodify(e.path, ":h")
+    if by_dir[dir] == nil then
+      local top = vim.trim(vim.fn.system({ "git", "-C", dir, "rev-parse", "--show-toplevel" }))
+      by_dir[dir] = vim.v.shell_error == 0 and top or false
+      if by_dir[dir] and not tops[top] then
+        -- Entries are "XY path", with directories ending in "/" (collapsed).
+        -- vim.system keeps the NUL separators (vim.fn.system would replace them).
+        local out = vim.system({ "git", "-C", top, "status", "--porcelain", "-z", "--ignored=matching" },
+          { text = true }):wait().stdout or ""
+        local dirty = {}
+        for item in out:gmatch("[^%z]+") do
+          dirty[#dirty + 1] = top .. "/" .. item:sub(4)
+        end
+        tops[top] = dirty
+        sig[#sig + 1] = out
+      end
+    end
+    local top = by_dir[dir]
+    if top then
+      local is_clean = true
+      for _, d in ipairs(tops[top]) do
+        if d == e.path or (d:sub(-1) == "/" and under(e.path, d:sub(1, -2))) then
+          is_clean = false
+          break
+        end
+      end
+      if is_clean then clean[e.path] = true end
+    end
+  end
+  return clean, table.concat(sig, "\n")
+end
+
 local function apply_filters(all)
   local f, out = M.filters, {}
   for _, e in ipairs(all) do
     if (not f.agent or e.agent == f.agent)
       and (not f.session or e.session == f.session)
-      and (not f.project or in_project(e)) then
+      and (not f.project or in_project(e))
+      and not (M.hide_committed and M.clean and M.clean[e.path]) then
       out[#out + 1] = e
     end
   end
@@ -125,6 +174,7 @@ local function filter_labels()
   if f.agent then out[#out + 1] = f.agent end
   if f.session then out[#out + 1] = "sess:" .. f.session:sub(1, 6) end
   if f.project then out[#out + 1] = "project" end
+  if M.hide_committed then out[#out + 1] = "uncommitted" end
   return out
 end
 
@@ -288,9 +338,11 @@ end
 
 local function refresh(force)
   local all, per_session = read_entries()
+  local git_sig = ""
+  if M.hide_committed then M.clean, git_sig = committed_files(all) end
   local entries = apply_filters(all)
   M.total, M.all = #all, all
-  local sig = {}
+  local sig = { git_sig }
   for _, e in ipairs(per_session) do sig[#sig + 1] = e.ts .. e.session .. e.path end
   sig = table.concat(sig, "\n")
   if not force and sig == M.signature then
@@ -669,7 +721,35 @@ end
 
 local function clear_filters()
   M.filters = { agent = nil, session = nil, project = false }
+  M.hide_committed = false
   refresh(true)
+end
+
+local function toggle_hide_committed()
+  M.hide_committed = not M.hide_committed
+  refresh(true)
+end
+
+-- :AgentEditsClear forgets this project's edits, :AgentEditsClear! all of
+-- them. The hook script rewrites the log under the lock the hook uses.
+local function clear_history(all)
+  local args = all and { log_cmd, "--clear-all" } or { log_cmd, "--clear", root }
+  local count = tonumber(vim.trim(vim.fn.system(vim.list_extend(vim.deepcopy(args), { "--dry-run" }))))
+  if not count then
+    vim.notify("agent-edits: could not read the history (" .. log_cmd .. ")", vim.log.levels.ERROR)
+    return
+  end
+  if count == 0 then
+    vim.notify("agent-edits: nothing to clear")
+    return
+  end
+  local what = all and "ALL agent edits" or ("the edits of " .. vim.fn.fnamemodify(root, ":~"))
+  local answer = vim.fn.confirm(string.format("Forget %s (%d log entries)?", what, count), "&Yes\n&No", 2)
+  vim.cmd("redraw")
+  if answer ~= 1 then return end
+  vim.fn.system(args)
+  refresh(true)
+  vim.notify(string.format("agent-edits: cleared %d entries", count))
 end
 
 local HELP = {
@@ -684,6 +764,7 @@ local HELP = {
   "   a                 filter by agent: all, Claude, Codex, Grok",
   "   s                 only the session of the selected file (toggle)",
   "   p                 only this project (toggle)",
+  "   H                 hide files with nothing left to commit (toggle)",
   "   F                 clear the filters",
   "   @                 paste @path into the agent's prompt (also on a",
   "                     visual selection of rows)",
@@ -702,6 +783,10 @@ local HELP = {
   "   d / Enter         paste into the agent's prompt and hide the popup",
   "   c                 write a comment, then paste the code and the comment",
   "                     (popup stays open, so you can queue several)",
+  "",
+  " Commands",
+  "   :AgentEditsClear  forget this project's edits (! for all of them)",
+  "   :AgentEditsHelp   this help",
   "",
   " All other Vim motions work as usual; buffers are read-only.",
   " Close this help with q or Esc.",
@@ -758,6 +843,9 @@ local function setup()
   map("s", toggle_session, lb)
   map("p", toggle_project, lb)
   map("F", clear_filters, lb)
+  map("H", toggle_hide_committed, lb)
+  vim.api.nvim_create_user_command("AgentEditsClear", function(o) clear_history(o.bang) end,
+    { bang = true, desc = "agent-edits: forget this project's edits (! for all)" })
   map("@", function()
     local row = vim.api.nvim_win_get_cursor(M.list_win)[1]
     send_references(row, row)

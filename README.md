@@ -105,6 +105,7 @@ is already running in the background, the same key brings it back as you left it
 | `a` | list | Filter by agent: all, Claude, Codex, Grok (only the agents in the log) |
 | `s` | list | Show only the session that edited the selected file (toggle) |
 | `p` | list | Show only this project (toggle): files under the directory, or edited by a session started in it, above it or below it |
+| `H` | list | Hide files with nothing left to commit: tracked by git and unchanged since `HEAD` (toggle). Untracked, ignored and non-git files stay visible. The list updates when you commit. |
 | `F` | list | Clear the filters |
 | `@` | list | Paste `@path` into the agent's prompt (a file reference for Claude Code and Codex). Works on a visual selection of rows too. The viewer stays open. |
 | `]f` / `[f` | anywhere | Next / previous edited file |
@@ -118,6 +119,7 @@ is already running in the background, the same key brings it back as you left it
 | `d` / `Enter` | visual selection | Paste into the agent's prompt and hide the popup |
 | `c` | visual selection | Ask for a comment, then paste the code followed by the comment. The viewer stays open, so you can queue several comments before you switch to the agent. `Esc` or an empty comment sends nothing. |
 | `:AgentEditsHelp` / `g?` | anywhere | Show these key bindings |
+| `:AgentEditsClear` | command | Forget this project's edits, after asking for confirmation. This uses the same project rule as `p`. `:AgentEditsClear!` forgets every edit. Snapshots that are no longer used are deleted. |
 
 All other Vim motions work in the code window: search, marks, `%`, `Ctrl-d`/`Ctrl-u`,
 `Ctrl-f`/`Ctrl-b` and so on. The buffers are read-only. Running `:q` on the diff window ends only the diff.
@@ -143,6 +145,7 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
 - Only edits made after you install the hook are recorded.
 - `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
 - Files that no longer exist are hidden. Log entries older than 14 days are pruned once the log grows past about 1 MB.
+  `:AgentEditsClear` clears the history at any time.
 
 ## Troubleshooting
 
