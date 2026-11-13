@@ -105,6 +105,8 @@ is already running in the background, the same key brings it back as you left it
 | `a` | list | Filter by agent: all, Claude, Codex, Grok (only the agents in the log) |
 | `s` | list | Show only the session that edited the selected file (toggle) |
 | `p` | list | Show only this project (toggle): files under the directory, or edited by a session started in it, above it or below it |
+| `x` | list | Mark the file as reviewed, or remove the mark. This also works on a visual selection. Reviewed files are dimmed, marked `✓` and moved below the others, and the cursor moves on to the next file to review. A new edit brings the file back as unreviewed. Marks are kept in `reviewed.tsv` and survive restarts. |
+| `X` | list | Hide reviewed files (toggle) |
 | `H` | list | Hide files with nothing left to commit: tracked by git and unchanged since `HEAD` (toggle). Untracked, ignored and non-git files stay visible. The list updates when you commit. |
 | `F` | list | Clear the filters |
 | `@` | list | Paste `@path` into the agent's prompt (a file reference for Claude Code and Codex). Works on a visual selection of rows too. The viewer stays open. |
