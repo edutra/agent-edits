@@ -99,6 +99,8 @@ is already running in the background, the same key brings it back as you left it
 |-----|-------|--------|
 | `j` / `k`, `gg` / `G` | list | Select a file (the preview updates) |
 | `Enter` / `l` | list | Jump into the code |
+| `t` | list | Group the list by agent session (toggle). Each group has a header with the agent, the project, the number of files and the last edit. A file edited by two sessions appears in both groups. |
+| `za` | list | Fold / unfold the session group under the cursor |
 | `r` | list | Reload the list now |
 | `a` | list | Filter by agent: all, Claude, Codex, Grok (only the agents in the log) |
 | `s` | list | Show only the session that edited the selected file (toggle) |

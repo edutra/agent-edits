@@ -48,8 +48,19 @@ local function display_name(path, project)
   return vim.fn.fnamemodify(path, ":~")
 end
 
+local function sort_entries(list)
+  table.sort(list, function(a, b)
+    if a.ts == b.ts then return a.rel < b.rel end
+    return a.ts > b.ts
+  end)
+  return list
+end
+
+-- The logged files that still exist, newest first: the latest edit of each
+-- path (flat list), and the latest edit of each path per session (grouped
+-- list, where a file edited by two sessions belongs to both).
 local function read_entries()
-  local latest = {}
+  local latest, per_session = {}, {}
   local fh = io.open(log_file, "r")
   if fh then
     for line in fh:lines() do
@@ -57,27 +68,27 @@ local function read_entries()
       local f = vim.split(line, "\t", { plain = true })
       local ts, path = tonumber(f[1]), f[3]
       if ts and path and path ~= "" then
-        if not latest[path] or latest[path].ts <= ts then
-          latest[path] = {
-            ts = ts, agent = f[2], path = path, rel = display_name(path, f[4]),
-            project = f[4] or "", session = f[5] or "-",
-          }
-        end
+        local e = {
+          ts = ts, agent = f[2], path = path, rel = display_name(path, f[4]),
+          project = f[4] or "", session = f[5] or "-",
+        }
+        if not latest[path] or latest[path].ts <= ts then latest[path] = e end
+        local key = e.session .. "\0" .. path
+        if not per_session[key] or per_session[key].ts <= ts then per_session[key] = e end
       end
     end
     fh:close()
   end
-  local list = {}
-  for _, e in pairs(latest) do
-    if vim.fn.filereadable(e.path) == 1 then
-      table.insert(list, e)
+  local exists = {}
+  local function existing(t)
+    local out = {}
+    for _, e in pairs(t) do
+      if exists[e.path] == nil then exists[e.path] = vim.fn.filereadable(e.path) == 1 end
+      if exists[e.path] then out[#out + 1] = e end
     end
+    return sort_entries(out)
   end
-  table.sort(list, function(a, b)
-    if a.ts == b.ts then return a.rel < b.rel end
-    return a.ts > b.ts
-  end)
-  return list
+  return existing(latest), existing(per_session)
 end
 
 -- Filters ------------------------------------------------------------------
@@ -117,10 +128,12 @@ local function filter_labels()
   return out
 end
 
+-- The list is a sequence of rows: { entry = e } for a file, { group = g }
+-- for a session header in the grouped view.
 local function selected()
   if not (M.list_win and vim.api.nvim_win_is_valid(M.list_win)) then return nil end
-  local row = vim.api.nvim_win_get_cursor(M.list_win)[1]
-  return M.entries[row]
+  local row = (M.rows or {})[vim.api.nvim_win_get_cursor(M.list_win)[1]]
+  return row and row.entry
 end
 
 local function diff_off()
@@ -149,11 +162,17 @@ end
 local function preview(e, force)
   if not e or not vim.api.nvim_win_is_valid(M.code_win) then return end
   if not force and M.current == e.path then
+    -- Same file under another session (grouped view): other baseline.
+    if M.current_session ~= e.session then
+      M.current_session = e.session
+      diff_off()
+      if M.update_markers then M.update_markers(e) end
+    end
     set_code_winbar(e)
     return
   end
   diff_off()
-  M.current = e.path
+  M.current, M.current_session = e.path, e.session
   vim.api.nvim_win_call(M.code_win, function()
     vim.cmd("silent! keepalt edit " .. vim.fn.fnameescape(e.path))
     vim.bo.modifiable = false
@@ -162,63 +181,189 @@ local function preview(e, force)
   set_code_winbar(e)
 end
 
+-- Session groups ------------------------------------------------------------
+-- t toggles the grouped view: one header per agent session, its files below.
+
+M.grouped, M.folded = false, {}
+local list_ns = vim.api.nvim_create_namespace("agent-edits-list")
+
+local function group_key(e)
+  return e.session ~= "-" and e.session or (e.agent .. "|" .. e.project)
+end
+
+local function build_rows(entries, per_session)
+  local rows = {}
+  if not M.grouped then
+    for _, e in ipairs(entries) do rows[#rows + 1] = { entry = e } end
+    return rows
+  end
+  -- per_session is sorted newest first, so groups come out newest first too.
+  local groups, order = {}, {}
+  for _, e in ipairs(per_session) do
+    local key = group_key(e)
+    if not groups[key] then
+      groups[key] = { key = key, agent = e.agent, project = e.project, ts = e.ts, files = {} }
+      order[#order + 1] = groups[key]
+    end
+    table.insert(groups[key].files, e)
+  end
+  for _, g in ipairs(order) do
+    rows[#rows + 1] = { group = g }
+    if not M.folded[g.key] then
+      for _, e in ipairs(g.files) do rows[#rows + 1] = { entry = e } end
+    end
+  end
+  return rows
+end
+
+-- "<left><padding><right>" in exactly `width` cells, cutting `left` from the start.
+local function fit(left, right, width)
+  local room = width - vim.fn.strdisplaywidth(right)
+  if vim.fn.strdisplaywidth(left) > room then
+    left = "…" .. vim.fn.strcharpart(left, vim.fn.strchars(left) - (room - 1))
+  end
+  return left .. string.rep(" ", room - vim.fn.strdisplaywidth(left)) .. right
+end
+
 local function render()
-  local lines = {}
-  if #M.entries == 0 and #filter_labels() > 0 then
+  local lines, headers = {}, {}
+  if #M.rows == 0 and #filter_labels() > 0 then
     lines = { "", "  No files match the filters:", "  " .. table.concat(filter_labels(), " "),
       "", "  F clears them." }
-  elseif #M.entries == 0 then
+  elseif #M.rows == 0 then
     lines = { "", "  No files edited by agents yet." }
   else
-    for _, e in ipairs(M.entries) do
-      local suffix = string.format(" %s %s", e.agent, ago(e.ts))
-      local room = LIST_WIDTH - 2 - vim.fn.strdisplaywidth(suffix)
-      local name = e.rel
-      if vim.fn.strdisplaywidth(name) > room then
-        name = "…" .. name:sub(-(room - 1))
+    for i, row in ipairs(M.rows) do
+      if row.group then
+        local g = row.group
+        local where = g.project ~= "" and vim.fn.fnamemodify(g.project, ":~") or "?"
+        local mark = M.folded[g.key] and "▸" or "▾"
+        lines[i] = fit(string.format(" %s %s %s", mark, g.agent, where),
+          string.format(" %d %s", #g.files, ago(g.ts)), LIST_WIDTH - 1)
+        headers[#headers + 1] = i
+      elseif M.grouped then
+        lines[i] = fit("   " .. row.entry.rel, " " .. ago(row.entry.ts), LIST_WIDTH - 1)
+      else
+        local e = row.entry
+        lines[i] = fit(" " .. e.rel, string.format(" %s %s", e.agent, ago(e.ts)), LIST_WIDTH - 1)
       end
-      lines[#lines + 1] = " " .. name .. string.rep(" ", room - vim.fn.strdisplaywidth(name)) .. suffix
     end
   end
   vim.bo[M.list_buf].modifiable = true
   vim.api.nvim_buf_set_lines(M.list_buf, 0, -1, false, lines)
   vim.bo[M.list_buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(M.list_buf, list_ns, 0, -1)
+  for _, i in ipairs(headers) do
+    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
+      { line_hl_group = "Title", priority = 10 })
+  end
   local count = #M.entries == M.total and tostring(M.total) or (#M.entries .. "/" .. M.total)
-  local labels = table.concat(filter_labels(), " ")
+  local labels = filter_labels()
+  if M.grouped then table.insert(labels, 1, "by session") end
+  labels = table.concat(labels, " ")
   vim.wo[M.list_win].winbar = string.format(" Edits (%s)  %%#Comment#%s", count,
     labels ~= "" and labels or vim.fn.fnamemodify(root, ":t"))
 end
 
+-- Put the cursor on the row of `path` (preferring `session`), else on the
+-- first file row, and preview it.
+local function select_path(path, session)
+  local row
+  for i, r in ipairs(M.rows) do
+    if r.entry and r.entry.path == path then
+      if r.entry.session == session then row = i break end
+      row = row or i
+    end
+  end
+  if not row then
+    for i, r in ipairs(M.rows) do
+      if r.entry then row = i break end
+    end
+  end
+  if row then
+    vim.api.nvim_win_set_cursor(M.list_win, { row, 0 })
+    preview(M.rows[row].entry)
+  end
+end
+
 local function refresh(force)
-  local all = read_entries()
+  local all, per_session = read_entries()
   local entries = apply_filters(all)
   M.total, M.all = #all, all
   local sig = {}
-  for _, e in ipairs(entries) do sig[#sig + 1] = e.ts .. e.path end
+  for _, e in ipairs(per_session) do sig[#sig + 1] = e.ts .. e.session .. e.path end
   sig = table.concat(sig, "\n")
   if not force and sig == M.signature then
     -- Only the "x ago" labels change; refresh them once a minute.
     if os.time() - (M.rendered_at or 0) < 60 then return end
   end
-  local keep = M.current
+  local keep = selected()
   M.entries, M.signature, M.rendered_at = entries, sig, os.time()
+  M.rows = build_rows(entries, apply_filters(per_session))
   render()
-  local row = 1
-  for i, e in ipairs(entries) do
-    if e.path == keep then row = i break end
-  end
-  if #entries > 0 then
-    vim.api.nvim_win_set_cursor(M.list_win, { row, 0 })
-    preview(entries[row])
+  if keep then
+    select_path(keep.path, keep.session)
+  else
+    select_path(M.current)
   end
 end
 
+-- Move the selection `delta` file rows (headers are skipped); math.huge and
+-- -math.huge go to the last / first file.
 local function move(delta)
-  if #M.entries == 0 then return end
-  local row = vim.api.nvim_win_get_cursor(M.list_win)[1] + delta
-  row = math.max(1, math.min(#M.entries, row))
-  vim.api.nvim_win_set_cursor(M.list_win, { row, 0 })
-  preview(M.entries[row])
+  local rows = M.rows or {}
+  local cur = vim.api.nvim_win_get_cursor(M.list_win)[1]
+  local target
+  if math.abs(delta) == math.huge then
+    local from, to, step = 1, #rows, 1
+    if delta > 0 then from, to, step = #rows, 1, -1 end
+    for i = from, to, step do
+      if rows[i].entry then target = i break end
+    end
+  else
+    local step, i = delta > 0 and 1 or -1, cur
+    for _ = 1, math.abs(delta) do
+      local j = i + step
+      while rows[j] and not rows[j].entry do j = j + step end
+      if not rows[j] then break end
+      i = j
+    end
+    if rows[i] and rows[i].entry then target = i end
+  end
+  if target then
+    vim.api.nvim_win_set_cursor(M.list_win, { target, 0 })
+    preview(rows[target].entry)
+  end
+end
+
+local function toggle_grouped()
+  M.grouped = not M.grouped
+  refresh(true)
+end
+
+-- Enter on a header folds or unfolds its group, Enter on a file jumps into
+-- the code. za folds / unfolds the group of the header or file under the cursor.
+local function list_enter(fold_only)
+  local cur = vim.api.nvim_win_get_cursor(M.list_win)[1]
+  local row = M.rows[cur]
+  if row and row.entry and fold_only and M.grouped then
+    for i = cur, 1, -1 do
+      if M.rows[i].group then row = M.rows[i] break end
+    end
+  end
+  if row and row.group then
+    local key = row.group.key
+    M.folded[key] = not M.folded[key]
+    refresh(true)
+    for i, r in ipairs(M.rows) do
+      if r.group and r.group.key == key then
+        vim.api.nvim_win_set_cursor(M.list_win, { i, 0 })
+        break
+      end
+    end
+  elseif row and not fold_only then
+    vim.api.nvim_set_current_win(M.code_win)
+  end
 end
 
 -- The file as committed in HEAD, from the repository that holds it.
@@ -475,8 +620,8 @@ end
 local function send_references(first, last)
   local target, refs = agent_target(), {}
   for row = first, last do
-    local e = M.entries[row]
-    if e then refs[#refs + 1] = "@" .. agent_path(e.path, target, true) end
+    local r = M.rows[row]
+    if r and r.entry then refs[#refs + 1] = "@" .. agent_path(r.entry.path, target, true) end
   end
   if #refs == 0 then return end
   local text = table.concat(refs, " ") .. " "
@@ -533,6 +678,8 @@ local HELP = {
   " File list",
   "   j / k, gg / G     select a file (the preview follows)",
   "   Enter / l         jump into the code",
+  "   t                 group by agent session (toggle)",
+  "   za                fold / unfold the session group",
   "   r                 reload the list now",
   "   a                 filter by agent: all, Claude, Codex, Grok",
   "   s                 only the session of the selected file (toggle)",
@@ -602,7 +749,9 @@ local function setup()
   map("<Up>", function() move(-1) end, lb)
   map("gg", function() move(-math.huge) end, lb)
   map("G", function() move(math.huge) end, lb)
-  map("<CR>", function() vim.api.nvim_set_current_win(M.code_win) end, lb)
+  map("<CR>", function() list_enter(false) end, lb)
+  map("za", function() list_enter(true) end, lb)
+  map("t", toggle_grouped, lb)
   map("l", function() vim.api.nvim_set_current_win(M.code_win) end, lb)
   map("r", function() refresh(true) end, lb)
   map("a", cycle_agent, lb)
