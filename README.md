@@ -114,6 +114,7 @@ is already running in the background, the same key brings it back as you left it
 | `:q`, `:qa`, `ZZ`, `ZQ` | list or code | Quit the viewer, as in plain Neovim |
 | `y` | visual selection | Paste the selected lines into the agent's prompt and keep the viewer open |
 | `d` / `Enter` | visual selection | Paste into the agent's prompt and hide the popup |
+| `c` | visual selection | Ask for a comment, then paste the code followed by the comment. The viewer stays open, so you can queue several comments before you switch to the agent. `Esc` or an empty comment sends nothing. |
 | `:AgentEditsHelp` / `g?` | anywhere | Show these key bindings |
 
 All other Vim motions work in the code window: search, marks, `%`, `Ctrl-d`/`Ctrl-u`,
