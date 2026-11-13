@@ -62,8 +62,13 @@ patch() {
       rm -f "$tmp"
     else
       local dest="$file.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
-      mv "$tmp" "$dest"
-      echo "  backup: $dest"
+      if [[ -e "$dest" ]]; then
+        # Already backed up this run (same second): that copy is the original.
+        rm -f "$tmp"
+      else
+        mv "$tmp" "$dest"
+        echo "  backup: $dest"
+      fi
     fi
   fi
 }
