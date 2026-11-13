@@ -12,7 +12,7 @@ Code and Codex both read `@path` in the prompt as a file reference.
 - `@` in the list pastes `@<path> ` (with a trailing space) into the agent's prompt
   and keeps the viewer open, so you can add several files and then switch back.
 - The path is relative to the agent pane's directory, the same rule as for snippets.
-  Outside that directory it is absolute (with `~`), because the agents resolve `@`
+  Outside that directory it is absolute (without `~`), because the agents resolve `@`
   relative to their working directory.
 - Visual `@` in the list sends every selected file, separated by spaces.
 - Reuse the snippet delivery: extract a `send_text(text, hide)` helper from
@@ -22,6 +22,6 @@ Code and Codex both read `@path` in the prompt as a file reference.
 ## Verification
 
 - `@` on a file under the agent's directory pastes `@src/a.py `.
-- On a file elsewhere, it pastes `@~/other/x.py `.
+- On a file elsewhere, it pastes the absolute path, `@/home/me/other/x.py `.
 - Visual selection of 3 rows pastes 3 references.
 - With no agent pane known, the text goes to the clipboard, as for snippets.

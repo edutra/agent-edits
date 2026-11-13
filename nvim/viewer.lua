@@ -378,55 +378,98 @@ local function hide_popup()
   end
 end
 
--- Paste the visually selected lines into the agent's prompt, as a fenced
--- block headed by "path:first-last". Bracketed paste keeps the newlines from
--- submitting the prompt.
-local function send_selection(hide)
-  local buf = vim.api.nvim_get_current_buf()
-  local path = vim.api.nvim_buf_get_name(buf)
+-- Sending to the agent -----------------------------------------------------
+
+-- The agent pane the popup was opened from, in the outer tmux server.
+local function agent_target()
+  local socket, pane = inner_option("@ae_socket"), inner_option("@ae_pane")
+  if socket == "" or pane == "" then return nil end
+  return { tmux = { "tmux", "-S", socket }, pane = pane }
+end
+
+local function outer(target, args)
+  return vim.list_extend(vim.deepcopy(target.tmux), args)
+end
+
+-- A path as the agent should see it: relative to the agent pane's directory
+-- when inside it, absolute otherwise (agents don't expand ~ in @references).
+local function agent_path(path, target, absolute_fallback)
+  local base = root
+  if target then
+    local dir = vim.trim(vim.fn.system(outer(target,
+      { "display-message", "-p", "-t", target.pane, "#{pane_current_path}" })))
+    if vim.v.shell_error == 0 and dir ~= "" then base = dir end
+  end
+  if base ~= "/" and path ~= base and under(path, base) then return path:sub(#base + 2) end
+  return absolute_fallback and path or vim.fn.fnamemodify(path, ":~")
+end
+
+-- Paste text into the agent's prompt with bracketed paste, so newlines don't
+-- submit it. Falls back to the clipboard. Hides the popup when `hide`, else
+-- shows `what` as confirmation.
+local function send_text(text, hide, what, target)
+  target = target or agent_target()
+  if not target then
+    vim.fn.setreg("+", text)
+    vim.notify("agent-edits: no agent pane known, copied to the clipboard instead")
+    return false
+  end
+  vim.fn.system(outer(target, { "load-buffer", "-b", "agent-edits", "-" }), text)
+  vim.fn.system(outer(target, { "paste-buffer", "-p", "-d", "-b", "agent-edits", "-t", target.pane }))
+  if vim.v.shell_error ~= 0 then
+    vim.fn.setreg("+", text)
+    vim.notify("agent-edits: agent pane is gone, copied to the clipboard instead", vim.log.levels.WARN)
+    return false
+  end
+  if hide then
+    hide_popup()
+  else
+    vim.notify("agent-edits: sent " .. what)
+  end
+  return true
+end
+
+-- The visual line range, leaving visual mode.
+local function visual_range()
   local first, last = vim.fn.line("v"), vim.fn.line(".")
   if first > last then first, last = last, first end
   vim.api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
+  return first, last
+end
+
+-- Paste the visually selected lines into the agent's prompt, as a fenced
+-- block headed by "path:first-last".
+local function send_selection(hide)
+  local buf = vim.api.nvim_get_current_buf()
+  local path = vim.api.nvim_buf_get_name(buf)
+  local first, last = visual_range()
   if vim.bo[buf].buftype ~= "" or path == "" then
     vim.notify("agent-edits: select code in the file window", vim.log.levels.WARN)
     return
   end
-
-  local socket, pane = inner_option("@ae_socket"), inner_option("@ae_pane")
-  local outer = socket ~= "" and { "tmux", "-S", socket } or nil
-  local base = outer and vim.trim(vim.fn.system(vim.list_extend(vim.deepcopy(outer),
-    { "display-message", "-p", "-t", pane, "#{pane_current_path}" }))) or root
-  local name = (base ~= "" and under(path, base) and path ~= base) and path:sub(#base + 2)
-    or vim.fn.fnamemodify(path, ":~")
-  local range = first == last and tostring(first) or (first .. "-" .. last)
+  local target = agent_target()
+  local where = agent_path(path, target) .. ":" .. (first == last and first or (first .. "-" .. last))
   local text = table.concat({
-    name .. ":" .. range,
+    where,
     "```" .. vim.bo[buf].filetype,
     table.concat(vim.api.nvim_buf_get_lines(buf, first - 1, last, false), "\n"),
     "```",
     "",
   }, "\n")
+  send_text(text, hide, where, target)
+end
 
-  if not (outer and pane ~= "") then
-    vim.fn.setreg("+", text)
-    vim.notify("agent-edits: no agent pane known, copied to the clipboard instead")
-    return
+-- Paste "@path " references to the selected files (list rows) into the
+-- agent's prompt. Claude Code and Codex read them as file references.
+local function send_references(first, last)
+  local target, refs = agent_target(), {}
+  for row = first, last do
+    local e = M.entries[row]
+    if e then refs[#refs + 1] = "@" .. agent_path(e.path, target, true) end
   end
-  local load = vim.list_extend(vim.deepcopy(outer), { "load-buffer", "-b", "agent-edits", "-" })
-  vim.fn.system(load, text)
-  local paste = vim.list_extend(vim.deepcopy(outer),
-    { "paste-buffer", "-p", "-d", "-b", "agent-edits", "-t", pane })
-  vim.fn.system(paste)
-  if vim.v.shell_error ~= 0 then
-    vim.fn.setreg("+", text)
-    vim.notify("agent-edits: agent pane is gone, copied to the clipboard instead", vim.log.levels.WARN)
-    return
-  end
-  if hide then
-    hide_popup()
-  else
-    vim.notify(string.format("agent-edits: sent %s:%s", name, range))
-  end
+  if #refs == 0 then return end
+  local text = table.concat(refs, " ") .. " "
+  send_text(text, false, vim.trim(text), target)
 end
 
 local AGENT_ORDER = { Claude = 1, Codex = 2, Grok = 3 }
@@ -484,6 +527,8 @@ local HELP = {
   "   s                 only the session of the selected file (toggle)",
   "   p                 only this project (toggle)",
   "   F                 clear the filters",
+  "   @                 paste @path into the agent's prompt (also on a",
+  "                     visual selection of rows)",
   "",
   " Anywhere",
   "   ]f / [f           next / previous edited file",
@@ -551,6 +596,12 @@ local function setup()
   map("s", toggle_session, lb)
   map("p", toggle_project, lb)
   map("F", clear_filters, lb)
+  map("@", function()
+    local row = vim.api.nvim_win_get_cursor(M.list_win)[1]
+    send_references(row, row)
+  end, lb)
+  vim.keymap.set("x", "@", function() send_references(visual_range()) end,
+    { buffer = M.list_buf, silent = true, nowait = true })
 
   -- Global keys (every window, including the code and diff windows).
   map("]f", function() move(1) end)

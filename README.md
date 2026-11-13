@@ -104,6 +104,7 @@ is already running in the background, the same key brings it back as you left it
 | `s` | list | Show only the session that edited the selected file (toggle) |
 | `p` | list | Show only this project (toggle): files under the directory, or edited by a session started in it, above it or below it |
 | `F` | list | Clear the filters |
+| `@` | list | Paste `@path` into the agent's prompt (a file reference for Claude Code and Codex). Works on a visual selection of rows too. The viewer stays open. |
 | `]f` / `[f` | anywhere | Next / previous edited file |
 | `Ctrl-h` / `Ctrl-l` | anywhere | Move between the list and the code |
 | `D` | anywhere | Toggle a side-by-side diff of what the agent changed: the file before the session's first edit, next to the file now |
