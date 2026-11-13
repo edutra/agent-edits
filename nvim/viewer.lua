@@ -63,9 +63,6 @@ local function sort_entries(list)
   return list
 end
 
--- The logged files that still exist, newest first: the latest edit of each
--- path (flat list), and the latest edit of each path per session (grouped
--- list, where a file edited by two sessions belongs to both).
 -- reviewed.tsv: "<path>\t<edit time reviewed>". Returns the map and the raw
 -- text (part of the refresh signature, so marks made elsewhere show up).
 local function read_reviewed()
@@ -79,45 +76,94 @@ local function read_reviewed()
   return marks, raw
 end
 
+-- The parsed log, kept between refreshes: only the lines appended since the
+-- last read are parsed. When the log shrank or its first bytes changed (the
+-- hook pruned it, or :AgentEditsClear), it is parsed again from the start.
+-- latest: the latest edit of each path (flat list); per_session: the latest
+-- edit of each path per session (grouped list, where a file edited by two
+-- sessions belongs to both).
+local log_cache = { offset = 0, head = "", latest = {}, per_session = {} }
+
+local function read_log()
+  local c = log_cache
+  local st = vim.uv.fs_stat(log_file)
+  if not st then
+    log_cache = { offset = 0, head = "", latest = {}, per_session = {} }
+    return log_cache
+  end
+  if st.size == c.offset and c.mtime and st.mtime.sec == c.mtime.sec and st.mtime.nsec == c.mtime.nsec then
+    return c
+  end
+  local fh = io.open(log_file, "r")
+  if not fh then return c end
+  local head = fh:read(64) or ""
+  if st.size < c.offset or head:sub(1, #c.head) ~= c.head then
+    c = { offset = 0, head = "", latest = {}, per_session = {} }
+    log_cache = c
+  end
+  fh:seek("set", c.offset)
+  local text = fh:read("*a") or ""
+  fh:close()
+  -- The hook may be halfway through a line: leave it for the next read.
+  local cut = text:match(".*\n()")
+  text = cut and text:sub(1, cut - 1) or ""
+  c.offset, c.head, c.mtime = c.offset + #text, head, st.mtime
+  for line in text:gmatch("[^\n]+") do
+    -- <epoch> <agent> <path> [<project> [<session> ...]]; older lines have fewer columns.
+    local f = vim.split(line, "\t", { plain = true })
+    local ts, path = tonumber(f[1]), f[3]
+    if ts and path and path ~= "" then
+      local e = {
+        ts = ts, agent = f[2], path = path, rel = display_name(path, f[4]),
+        project = f[4] or "", session = f[5] or "-", via = f[6] or "tool",
+      }
+      if not c.latest[path] or c.latest[path].ts <= ts then c.latest[path] = e end
+      local key = e.session .. "\0" .. path
+      if not c.per_session[key] or c.per_session[key].ts <= ts then c.per_session[key] = e end
+    end
+  end
+  return c
+end
+
+-- The baseline the hook saved for `e` (the file before its session touched
+-- it), or nil when there is none.
+local function baseline_file(e)
+  if not e.session or e.session == "-" then return nil end
+  return baselines_dir .. "/" .. e.session .. "/" .. vim.fn.sha256(e.path)
+end
+
+-- The logged files to list, newest first, in both shapes (see read_log).
+-- A file that no longer exists stays listed, marked deleted, when there is a
+-- baseline to show what it held: the agent deleted it, or it was deleted
+-- after the agent edited it. Files a session created and then removed again
+-- (scratch files) have no baseline and are left out.
 local function read_entries()
-  local latest, per_session = {}, {}
   local marks
   marks, M.reviewed_raw = read_reviewed()
-  local fh = io.open(log_file, "r")
-  if fh then
-    for line in fh:lines() do
-      -- <epoch> <agent> <path> [<project> [<session> ...]]; older lines have fewer columns.
-      local f = vim.split(line, "\t", { plain = true })
-      local ts, path = tonumber(f[1]), f[3]
-      if ts and path and path ~= "" then
-        local e = {
-          ts = ts, agent = f[2], path = path, rel = display_name(path, f[4]),
-          project = f[4] or "", session = f[5] or "-", via = f[6] or "tool",
-        }
-        if not latest[path] or latest[path].ts <= ts then latest[path] = e end
-        local key = e.session .. "\0" .. path
-        if not per_session[key] or per_session[key].ts <= ts then per_session[key] = e end
-      end
-    end
-    fh:close()
-  end
+  local log = read_log()
+  local latest = log.latest
   -- Reviewed until anyone edits the file again.
-  for _, t in ipairs({ latest, per_session }) do
+  for _, t in ipairs({ latest, log.per_session }) do
     for _, e in pairs(t) do
       local mark = marks[e.path]
       e.reviewed = mark ~= nil and latest[e.path] ~= nil and mark >= latest[e.path].ts
     end
   end
   local exists = {}
-  local function existing(t)
+  local function listed(t)
     local out = {}
     for _, e in pairs(t) do
-      if exists[e.path] == nil then exists[e.path] = vim.fn.filereadable(e.path) == 1 end
-      if exists[e.path] then out[#out + 1] = e end
+      if exists[e.path] == nil then exists[e.path] = vim.uv.fs_stat(e.path) ~= nil end
+      e.deleted = not exists[e.path]
+      if e.deleted and e.has_baseline == nil then
+        local base = baseline_file(e)
+        e.has_baseline = base ~= nil and vim.uv.fs_stat(base) ~= nil
+      end
+      if not e.deleted or e.has_baseline then out[#out + 1] = e end
     end
     return sort_entries(out)
   end
-  return existing(latest), existing(per_session)
+  return listed(latest), listed(log.per_session)
 end
 
 -- Filters ------------------------------------------------------------------
@@ -143,42 +189,84 @@ end
 -- non-git files always stay visible.
 
 M.hide_committed = false
+-- Clean files and a signature of the git state (so a commit refreshes the
+-- list), filled in the background: git status is slow in big repositories
+-- and must not freeze the viewer every 2 seconds.
+M.git = { clean = {}, sig = "", busy = false, done_at = 0, tops = {} }
 
--- Set of absolute paths of committed files among `entries`, plus a signature
--- of the git state, so a commit refreshes the list.
-local function committed_files(entries)
-  local tops, by_dir, clean, sig = {}, {}, {}, {}
+-- The work tree that holds `dir`, or false. Looked up once per directory,
+-- without running git.
+local function git_top(dir)
+  local tops = M.git.tops
+  if tops[dir] == nil then
+    local found = vim.fs.root(dir, ".git")
+    tops[dir] = found and found:gsub("(.)/$", "%1") or false
+  end
+  return tops[dir]
+end
+
+-- Starts git status in each work tree holding one of `entries`; when every
+-- one is done, stores the clean set and refreshes the list. Runs at most
+-- every 2 seconds, one round at a time.
+local function update_committed(entries, refresh)
+  local g = M.git
+  if g.busy or vim.uv.now() - g.done_at < 1500 then return end
+  local members, tops = {}, {}
   for _, e in ipairs(entries) do
-    local dir = vim.fn.fnamemodify(e.path, ":h")
-    if by_dir[dir] == nil then
-      local top = vim.trim(vim.fn.system({ "git", "-C", dir, "rev-parse", "--show-toplevel" }))
-      by_dir[dir] = vim.v.shell_error == 0 and top or false
-      if by_dir[dir] and not tops[top] then
-        -- Entries are "XY path", with directories ending in "/" (collapsed).
-        -- vim.system keeps the NUL separators (vim.fn.system would replace them).
-        local out = vim.system({ "git", "-C", top, "status", "--porcelain", "-z", "--ignored=matching" },
-          { text = true }):wait().stdout or ""
-        local dirty = {}
-        for item in out:gmatch("[^%z]+") do
-          dirty[#dirty + 1] = top .. "/" .. item:sub(4)
-        end
-        tops[top] = dirty
-        sig[#sig + 1] = out
-      end
-    end
-    local top = by_dir[dir]
+    local top = git_top(vim.fn.fnamemodify(e.path, ":h"))
     if top then
-      local is_clean = true
-      for _, d in ipairs(tops[top]) do
-        if d == e.path or (d:sub(-1) == "/" and under(e.path, d:sub(1, -2))) then
-          is_clean = false
-          break
-        end
-      end
-      if is_clean then clean[e.path] = true end
+      if not members[top] then members[top] = {} tops[#tops + 1] = top end
+      table.insert(members[top], e.path)
     end
   end
-  return clean, table.concat(sig, "\n")
+  table.sort(tops)
+  local results, pending = {}, #tops
+  local function finish()
+    g.busy, g.done_at = false, vim.uv.now()
+    local clean, sig = {}, {}
+    for _, top in ipairs(tops) do
+      local out = results[top]
+      if out then
+        -- Entries are "XY path", with directories ending in "/" (collapsed).
+        local dirty, dirty_dirs = {}, {}
+        for item in out:gmatch("[^%z]+") do
+          local path = top .. "/" .. item:sub(4)
+          if path:sub(-1) == "/" then dirty_dirs[#dirty_dirs + 1] = path:sub(1, -2) else dirty[path] = true end
+        end
+        for _, path in ipairs(members[top]) do
+          local is_clean = not dirty[path]
+          for _, d in ipairs(dirty_dirs) do
+            if not is_clean then break end
+            if under(path, d) then is_clean = false end
+          end
+          if is_clean then clean[path] = true end
+        end
+        sig[#sig + 1] = top .. "\n" .. out
+      end
+    end
+    g.clean, g.sig = clean, table.concat(sig, "\n")
+    if M.hide_committed then refresh(false) end
+  end
+  if pending == 0 then
+    g.clean, g.sig = {}, ""
+    return
+  end
+  g.busy = true
+  for _, top in ipairs(tops) do
+    local ok = pcall(vim.system, { "git", "-C", top, "status", "--porcelain", "-z", "--ignored=matching" },
+      { text = true }, function(obj)
+        vim.schedule(function()
+          results[top] = obj.code == 0 and obj.stdout or false
+          pending = pending - 1
+          if pending == 0 then finish() end
+        end)
+      end)
+    if not ok then
+      -- git is missing: nothing counts as committed.
+      pending = pending - 1
+      if pending == 0 then finish() end
+    end
+  end
 end
 
 local function apply_filters(all)
@@ -187,7 +275,7 @@ local function apply_filters(all)
     if (not f.agent or e.agent == f.agent)
       and (not f.session or e.session == f.session)
       and (not f.project or in_project(e))
-      and not (M.hide_committed and M.clean and M.clean[e.path])
+      and not (M.hide_committed and M.git.clean[e.path])
       and not (M.hide_reviewed and e.reviewed) then
       out[#out + 1] = e
     end
@@ -229,6 +317,7 @@ end
 
 local function set_code_winbar(e)
   local text = e and string.format(" %s  %%#Comment#(%s, %s ago)", e.rel, e.agent, ago(e.ts)) or ""
+  if e and e.deleted then text = text .. "  %#Removed#deleted" end
   local st = e and M.stats and M.stats[e.path]
   if st and (st.add + st.change + st.delete) > 0 then
     text = text .. string.format("  %%#Added#+%d %%#Changed#~%d %%#Removed#-%d", st.add, st.change, st.delete)
@@ -303,7 +392,7 @@ local function fit(left, right, width)
 end
 
 local function render()
-  local lines, headers, dimmed = {}, {}, {}
+  local lines, headers, dimmed, deleted = {}, {}, {}, {}
   if #M.rows == 0 and #filter_labels() > 0 then
     lines = { "", "  No files match the filters:", "  " .. table.concat(filter_labels(), " "),
       "", "  F clears them." }
@@ -320,14 +409,15 @@ local function render()
         headers[#headers + 1] = i
       elseif M.grouped then
         local e = row.entry
-        lines[i] = fit("   " .. e.rel, (e.reviewed and " ✓ " or " ") .. (e.via == "shell" and "$ " or "")
-          .. ago(e.ts), LIST_WIDTH - 1)
+        lines[i] = fit("   " .. e.rel, (e.reviewed and " ✓ " or " ") .. (e.deleted and "✗ " or "")
+          .. (e.via == "shell" and "$ " or "") .. ago(e.ts), LIST_WIDTH - 1)
       else
         local e = row.entry
-        lines[i] = fit(" " .. e.rel, string.format(" %s%s%s %s", e.reviewed and "✓ " or "", e.agent,
-          e.via == "shell" and "$" or "", ago(e.ts)), LIST_WIDTH - 1)
+        lines[i] = fit(" " .. e.rel, string.format(" %s%s%s%s %s", e.reviewed and "✓ " or "",
+          e.deleted and "✗ " or "", e.agent, e.via == "shell" and "$" or "", ago(e.ts)), LIST_WIDTH - 1)
       end
       if row.entry and row.entry.reviewed then dimmed[#dimmed + 1] = i end
+      if row.entry and row.entry.deleted then deleted[#deleted + 1] = i end
     end
   end
   vim.bo[M.list_buf].modifiable = true
@@ -341,6 +431,10 @@ local function render()
   for _, i in ipairs(dimmed) do
     vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
       { line_hl_group = "Comment", priority = 10 })
+  end
+  for _, i in ipairs(deleted) do
+    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
+      { line_hl_group = "AgentEditsDeleted", priority = 11 })
   end
   local count = #M.entries == M.total and tostring(M.total) or (#M.entries .. "/" .. M.total)
   local to_review = 0
@@ -381,11 +475,16 @@ end
 local function refresh(force)
   local all, per_session = read_entries()
   local git_sig = ""
-  if M.hide_committed then M.clean, git_sig = committed_files(all) end
+  if M.hide_committed then
+    update_committed(all, refresh)
+    git_sig = M.git.sig
+  end
   local entries = apply_filters(all)
   M.total, M.all = #all, all
   local sig = { git_sig, M.reviewed_raw }
-  for _, e in ipairs(per_session) do sig[#sig + 1] = e.ts .. e.session .. e.path end
+  for _, e in ipairs(per_session) do
+    sig[#sig + 1] = e.ts .. e.session .. e.path .. (e.deleted and "\tdeleted" or "")
+  end
   sig = table.concat(sig, "\n")
   if not force and sig == M.signature then
     -- Only the "x ago" labels change; refresh them once a minute.
@@ -472,8 +571,8 @@ end
 -- by the hook. Returns lines (empty for a file the session created) and a
 -- label, or nil when there is no usable baseline.
 local function baseline_lines(e)
-  if not e.session or e.session == "-" then return nil end
-  local base = baselines_dir .. "/" .. e.session .. "/" .. vim.fn.sha256(e.path)
+  local base = baseline_file(e)
+  if not base then return nil end
   local label = string.format("before %s (%s)", e.agent, e.session:sub(1, 8))
   if vim.uv.fs_stat(base .. ".new") then return {}, label .. ", new file" end
   if not vim.uv.fs_stat(base) then return nil end
@@ -517,7 +616,8 @@ function M.update_markers(e)
   local base = base_for(e, "agent")
   if not base then return end
   local old = table.concat(base, "\n") .. "\n"
-  local new = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") .. "\n"
+  -- A deleted file's buffer still has one empty line: compare with nothing.
+  local new = e.deleted and "" or (table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") .. "\n")
   if #old > MAX_DIFF_BYTES or #new > MAX_DIFF_BYTES then return end
   local ok, hunks = pcall(diff_fn, old, new, { result_type = "indices" })
   if not ok or type(hunks) ~= "table" then return end
@@ -729,6 +829,10 @@ end
 local function open_in_editor(split)
   local e = selected()
   if not e then return end
+  if e.deleted then
+    vim.notify("agent-edits: the file was deleted (D shows what it held)", vim.log.levels.WARN)
+    return
+  end
   -- The cursor line in the code window; from elsewhere, the first change.
   local line = 1
   if vim.api.nvim_get_current_win() == M.code_win then
@@ -848,6 +952,8 @@ end
 
 local function toggle_hide_committed()
   M.hide_committed = not M.hide_committed
+  -- Don't wait for the throttle: the result shows up once git is done.
+  M.git.done_at = 0
   refresh(true)
 end
 
@@ -916,6 +1022,7 @@ local HELP = {
   "",
   " Claude$ (a $ after the agent): the edit was inferred from a shell",
   " command; files changed meanwhile by something else may show up too.",
+  " ✗ (struck through): the file was deleted; D shows what it held.",
   "",
   " All other Vim motions work as usual; buffers are read-only.",
   " Close this help with q or Esc.",
@@ -943,7 +1050,15 @@ local function show_help()
   end
 end
 
+-- Deleted files in the list: struck through, in the colour of removed lines.
+local function set_highlights()
+  local removed = vim.api.nvim_get_hl(0, { name = "Removed", link = false })
+  vim.api.nvim_set_hl(0, "AgentEditsDeleted", { fg = removed.fg, ctermfg = removed.ctermfg, strikethrough = true })
+end
+
 local function setup()
+  set_highlights()
+  vim.api.nvim_create_autocmd("ColorScheme", { callback = set_highlights })
   M.code_win = vim.api.nvim_get_current_win()
   vim.cmd("topleft vnew")
   M.list_win = vim.api.nvim_get_current_win()
