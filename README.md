@@ -23,7 +23,9 @@ agent's prompt.
    - **before** the call (`PreToolUse`), it saves a copy of each file the tool is about to change.
      It does this once per agent session, in `~/.local/state/agent-edits/baselines/`. `D` uses
      this copy to show exactly what the session changed.
-   - **after** the call (`PostToolUse`), it appends `timestamp  agent  path  project  session`
+   - for **shell commands** (`Bash` and the equivalents in Codex and Grok), it records the files
+     that changed under the command's directory while the command ran (see Limitations).
+   - **after** the call (`PostToolUse`), it appends `timestamp  agent  path  project  session  via`
      to `~/.local/state/agent-edits/edits.tsv`. `project` is the directory the agent session was
      started in.
    - **Claude Code**: `Edit`, `Write`, `MultiEdit`, `NotebookEdit` (in `~/.claude/settings.json`).
@@ -142,8 +144,13 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
 
 ## Limitations
 
-- Only edits made through the agents' file-editing tools are recorded. Changes made with shell
-  commands (`sed -i`, `echo > file`, code generators) are not.
+- Changes made by the agents' shell commands (`sed -i`, `echo > file`, formatters, generators)
+  are inferred. Before a command runs, the hook notes the time. Afterwards, it lists the files
+  under the command's directory that changed since then. Inside git it uses modified and
+  untracked files and skips ignored ones. Outside git it walks the directory (bounded, skipping
+  `node_modules`, `.venv` and hidden directories). Such edits are marked `$` (`Claude$`). A file
+  something else changed during the command (your editor, another agent) can show up too.
+  `D` shows them against `HEAD`, because no snapshot is taken before a command.
 - Only edits made after you install the hook are recorded.
 - `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
 - Files that no longer exist are hidden. Log entries older than 14 days are pruned once the log grows past about 1 MB.

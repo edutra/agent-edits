@@ -12,8 +12,9 @@ PATCH=(python3 "$REPO/lib/config_patch.py")
 
 # Tools whose calls the hook logs, per agent. Grok reads Claude's settings and
 # maps Claude's tool names to its own.
-CLAUDE_MATCHER="Edit|Write|MultiEdit|NotebookEdit"
-CODEX_MATCHER="apply_patch|Edit|Write"
+# Shell tools are watched too, to catch files changed by commands.
+CLAUDE_MATCHER="Edit|Write|MultiEdit|NotebookEdit|Bash"
+CODEX_MATCHER="apply_patch|Edit|Write|Bash|shell|shell_command|exec_command|local_shell|unified_exec"
 
 key="e"
 do_claude=1 do_codex=1 do_tmux=1 codex_notice=0

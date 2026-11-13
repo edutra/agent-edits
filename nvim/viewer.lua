@@ -92,7 +92,7 @@ local function read_entries()
       if ts and path and path ~= "" then
         local e = {
           ts = ts, agent = f[2], path = path, rel = display_name(path, f[4]),
-          project = f[4] or "", session = f[5] or "-",
+          project = f[4] or "", session = f[5] or "-", via = f[6] or "tool",
         }
         if not latest[path] or latest[path].ts <= ts then latest[path] = e end
         local key = e.session .. "\0" .. path
@@ -320,11 +320,12 @@ local function render()
         headers[#headers + 1] = i
       elseif M.grouped then
         local e = row.entry
-        lines[i] = fit("   " .. e.rel, (e.reviewed and " ✓ " or " ") .. ago(e.ts), LIST_WIDTH - 1)
+        lines[i] = fit("   " .. e.rel, (e.reviewed and " ✓ " or " ") .. (e.via == "shell" and "$ " or "")
+          .. ago(e.ts), LIST_WIDTH - 1)
       else
         local e = row.entry
-        lines[i] = fit(" " .. e.rel, string.format(" %s%s %s", e.reviewed and "✓ " or "", e.agent,
-          ago(e.ts)), LIST_WIDTH - 1)
+        lines[i] = fit(" " .. e.rel, string.format(" %s%s%s %s", e.reviewed and "✓ " or "", e.agent,
+          e.via == "shell" and "$" or "", ago(e.ts)), LIST_WIDTH - 1)
       end
       if row.entry and row.entry.reviewed then dimmed[#dimmed + 1] = i end
     end
@@ -868,6 +869,9 @@ local HELP = {
   " Commands",
   "   :AgentEditsClear  forget this project's edits (! for all of them)",
   "   :AgentEditsHelp   this help",
+  "",
+  " Claude$ (a $ after the agent): the edit was inferred from a shell",
+  " command; files changed meanwhile by something else may show up too.",
   "",
   " All other Vim motions work as usual; buffers are read-only.",
   " Close this help with q or Esc.",
