@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: records every file an AI agent edits.
+"""Agent hook: records every file an AI agent edits.
 
-Reads the hook event (JSON) from stdin and appends one line per edited file to
-$XDG_STATE_HOME/agent-edits/edits.tsv:
-  <epoch>\t<agent>\t<absolute path>\t<project>
-where <project> is the directory the agent session was started in, so the
-viewer can show every file a project's agents touched, even outside it.
+Registered for PreToolUse and PostToolUse on the agents' edit tools. Reads the
+hook event (JSON) from stdin.
 
-Works with Claude Code (tool_name/tool_input), Grok (toolName/toolInput, also
-loads Claude's hooks) and Codex (apply_patch patch text). It never fails the
-agent: any error is swallowed and the exit code is always 0.
+PreToolUse   saves a baseline of each file the tool is about to touch, once
+             per agent session, in baselines/<session>/<sha256(path)>, so the
+             viewer can diff against the file as it was before the session.
+PostToolUse  appends one line per edited file to edits.tsv:
+               <epoch> <agent> <path> <project> <session>
+             <project> is the directory the agent session was started in.
+
+Everything lives in $XDG_STATE_HOME/agent-edits. Works with Claude Code
+(tool_name/tool_input), Grok (toolName/toolInput, also loads Claude's hooks)
+and Codex (apply_patch patch text). It never fails the agent: any error is
+swallowed and the exit code is always 0.
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -23,11 +30,15 @@ STATE_DIR = os.path.join(
     "agent-edits",
 )
 LOG = os.path.join(STATE_DIR, "edits.tsv")
+BASELINES = os.path.join(STATE_DIR, "baselines")
 PRUNE_BYTES = 1_000_000
 KEEP_SECONDS = 14 * 24 * 3600
+MAX_BASELINE_BYTES = 2_000_000
 
 PATH_KEYS = ("file_path", "filePath", "path", "target_file", "targetFile", "notebook_path")
 PATCH_RE = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.M)
+# Grok's camelCase event names, mapped to the names Claude and Codex use.
+GROK_EVENTS = {"pre_tool_use": "PreToolUse", "post_tool_use": "PostToolUse"}
 
 
 def collect(value, found):
@@ -45,11 +56,22 @@ def collect(value, found):
         found.extend(m.strip() for m in PATCH_RE.findall(value))
 
 
+def event_name(event):
+    name = event.get("hook_event_name") or GROK_EVENTS.get(event.get("hookEventName", ""), "")
+    return name or "PostToolUse"
+
+
 def agent_name(event):
     # Grok runs the hooks it finds in ~/.claude/settings.json and adds camelCase keys.
     if "hookEventName" in event:
         return "Grok"
     return sys.argv[1] if len(sys.argv) > 1 else "agent"
+
+
+def session_id(event):
+    sid = str(event.get("session_id") or event.get("sessionId") or "")
+    sid = re.sub(r"[^A-Za-z0-9._-]", "_", sid)[:80]
+    return sid or "-"
 
 
 def project_dir(event, cwd):
@@ -66,7 +88,45 @@ def project_dir(event, cwd):
     return os.path.normpath(os.path.expanduser(base))
 
 
+def edited_paths(event, cwd):
+    found = []
+    collect(event.get("tool_input", event.get("toolInput")), found)
+    paths = []
+    for p in found:
+        p = os.path.expanduser(p)
+        if p.startswith("file://"):
+            p = p[len("file://"):]
+        p = os.path.normpath(os.path.join(cwd, p))
+        if p not in paths:
+            paths.append(p)
+    return paths
+
+
+def baseline_key(path):
+    return hashlib.sha256(path.encode()).hexdigest()
+
+
+def save_baselines(session, paths):
+    """Keep each file as it was before the session's first edit to it."""
+    if session == "-":
+        return
+    folder = os.path.join(BASELINES, session)
+    os.makedirs(folder, exist_ok=True)
+    for path in paths:
+        base = os.path.join(folder, baseline_key(path))
+        if any(os.path.exists(base + ext) for ext in ("", ".new", ".skip")):
+            continue
+        if not os.path.exists(path):
+            open(base + ".new", "w").close()
+        elif not os.path.isfile(path) or os.path.getsize(path) > MAX_BASELINE_BYTES:
+            open(base + ".skip", "w").close()
+        else:
+            shutil.copyfile(path, base + ".tmp")
+            os.replace(base + ".tmp", base)
+
+
 def prune():
+    """Drop log lines and baselines older than KEEP_SECONDS once the log is big."""
     try:
         if os.path.getsize(LOG) < PRUNE_BYTES:
             return
@@ -75,8 +135,23 @@ def prune():
             lines = [l for l in fh if l.split("\t", 1)[0].isdigit() and int(l.split("\t", 1)[0]) >= cutoff]
         with open(LOG, "w", encoding="utf-8") as fh:
             fh.writelines(lines)
+        if os.path.isdir(BASELINES):
+            for entry in os.scandir(BASELINES):
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry.path, ignore_errors=True)
     except OSError:
         pass
+
+
+def log_edits(event, paths, cwd):
+    agent = agent_name(event)
+    project = project_dir(event, cwd)
+    session = session_id(event)
+    now = int(time.time())
+    with open(LOG, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\t{session}\n" for p in paths)
+        prune()
 
 
 def main():
@@ -87,29 +162,14 @@ def main():
             fh.write(raw.strip() + "\n")
 
     event = json.loads(raw)
-    tool_input = event.get("tool_input", event.get("toolInput"))
-    found = []
-    collect(tool_input, found)
-    if not found:
-        return
-
     cwd = event.get("cwd") or event.get("workspaceRoot") or os.getcwd()
-    agent = agent_name(event)
-    project = project_dir(event, cwd)
-    now = int(time.time())
-    paths = []
-    for p in found:
-        p = os.path.expanduser(p)
-        if p.startswith("file://"):
-            p = p[len("file://"):]
-        p = os.path.normpath(os.path.join(cwd, p))
-        if p not in paths:
-            paths.append(p)
-
-    with open(LOG, "a", encoding="utf-8") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\n" for p in paths)
-        prune()
+    paths = edited_paths(event, cwd)
+    if not paths:
+        return
+    if event_name(event) == "PreToolUse":
+        save_baselines(session_id(event), paths)
+    else:
+        log_edits(event, paths, cwd)
 
 
 if __name__ == "__main__":

@@ -94,15 +94,20 @@ echo "  $CONF_DIR/inner.conf -> $REPO/tmux/inner.conf"
 
 if ((do_claude)); then
   say "Claude Code / Grok hook"
-  patch "$CLAUDE_SETTINGS" "${PATCH[@]}" hooks-add "$CLAUDE_SETTINGS" PostToolUse \
-    "$CLAUDE_MATCHER" "$BIN_DIR/agent-edits-log Claude"
+  # PreToolUse snapshots files before the first edit; PostToolUse logs the edit.
+  for event in PreToolUse PostToolUse; do
+    patch "$CLAUDE_SETTINGS" "${PATCH[@]}" hooks-add "$CLAUDE_SETTINGS" "$event" \
+      "$CLAUDE_MATCHER" "$BIN_DIR/agent-edits-log Claude"
+  done
 fi
 
 if ((do_codex)); then
   say "Codex hook"
   if [[ -d "$(dirname "$CODEX_HOOKS")" ]]; then
-    patch "$CODEX_HOOKS" "${PATCH[@]}" hooks-add "$CODEX_HOOKS" PostToolUse \
-      "$CODEX_MATCHER" "$BIN_DIR/agent-edits-log Codex"
+    for event in PreToolUse PostToolUse; do
+      patch "$CODEX_HOOKS" "${PATCH[@]}" hooks-add "$CODEX_HOOKS" "$event" \
+        "$CODEX_MATCHER" "$BIN_DIR/agent-edits-log Codex"
+    done
     codex_notice=1
   else
     echo "  Codex not found, skipping"
