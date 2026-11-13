@@ -438,8 +438,9 @@ local function visual_range()
 end
 
 -- Paste the visually selected lines into the agent's prompt, as a fenced
--- block headed by "path:first-last".
-local function send_selection(hide)
+-- block headed by "path:first-last". With `ask_comment`, first ask for a
+-- comment and send it below the block (an empty comment cancels).
+local function send_selection(hide, ask_comment)
   local buf = vim.api.nvim_get_current_buf()
   local path = vim.api.nvim_buf_get_name(buf)
   local first, last = visual_range()
@@ -449,14 +450,24 @@ local function send_selection(hide)
   end
   local target = agent_target()
   local where = agent_path(path, target) .. ":" .. (first == last and first or (first .. "-" .. last))
-  local text = table.concat({
+  local block = {
     where,
     "```" .. vim.bo[buf].filetype,
     table.concat(vim.api.nvim_buf_get_lines(buf, first - 1, last, false), "\n"),
     "```",
-    "",
-  }, "\n")
-  send_text(text, hide, where, target)
+  }
+  if not ask_comment then
+    send_text(table.concat(block, "\n") .. "\n", hide, where, target)
+    return
+  end
+  vim.ui.input({ prompt = "Comment on " .. where .. ": " }, function(comment)
+    if not comment or vim.trim(comment) == "" then
+      vim.notify("agent-edits: nothing sent")
+      return
+    end
+    block[#block + 1] = comment
+    send_text(table.concat(block, "\n") .. "\n", hide, where .. " with a comment", target)
+  end)
 end
 
 -- Paste "@path " references to the selected files (list rows) into the
@@ -542,6 +553,8 @@ local HELP = {
   " Visual selection in the code",
   "   y                 paste into the agent's prompt, keep the popup open",
   "   d / Enter         paste into the agent's prompt and hide the popup",
+  "   c                 write a comment, then paste the code and the comment",
+  "                     (popup stays open, so you can queue several)",
   "",
   " All other Vim motions work as usual; buffers are read-only.",
   " Close this help with q or Esc.",
@@ -623,6 +636,7 @@ local function setup()
   vim.keymap.set("x", "y", function() send_selection(false) end, { silent = true })
   vim.keymap.set("x", "d", function() send_selection(true) end, { silent = true })
   vim.keymap.set("x", "<CR>", function() send_selection(true) end, { silent = true })
+  vim.keymap.set("x", "c", function() send_selection(false, true) end, { silent = true })
 
   vim.api.nvim_create_user_command("AgentEditsHelp", show_help, { desc = "agent-edits key bindings" })
   map("g?", show_help)
