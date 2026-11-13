@@ -47,7 +47,7 @@ The hook never blocks or fails an agent. It always exits with code 0.
 
 - Linux or macOS
 - `python3` (3.8 or newer)
-- Neovim 0.9 or newer
+- Neovim 0.10 or newer
 - tmux 3.3 or newer (for `display-popup`)
 - git (optional, for `gD` and as a fallback for `D`)
 
@@ -103,6 +103,7 @@ is already running in the background, the same key brings it back as you left it
 | `Ctrl-h` / `Ctrl-l` | anywhere | Move between the list and the code |
 | `D` | anywhere | Toggle a side-by-side diff of what the agent changed: the file before the session's first edit, next to the file now |
 | `gD` | anywhere | Toggle a side-by-side diff against `HEAD` |
+| `]c` / `[c` | anywhere | Next / previous change. Changed lines are marked in the margin (`▎` added or changed, `▁` deleted below), and the code winbar shows `+added ~changed -deleted`. |
 | `Ctrl-z` or `prefix + e` | anywhere | Hide the popup. The viewer keeps running. |
 | `:q`, `:qa`, `ZZ`, `ZQ` | list or code | Quit the viewer, as in plain Neovim |
 | `y` | visual selection | Paste the selected lines into the agent's prompt and keep the viewer open |

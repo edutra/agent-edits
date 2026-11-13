@@ -97,6 +97,10 @@ end
 
 local function set_code_winbar(e)
   local text = e and string.format(" %s  %%#Comment#(%s, %s ago)", e.rel, e.agent, ago(e.ts)) or ""
+  local st = e and M.stats and M.stats[e.path]
+  if st and (st.add + st.change + st.delete) > 0 then
+    text = text .. string.format("  %%#Added#+%d %%#Changed#~%d %%#Removed#-%d", st.add, st.change, st.delete)
+  end
   vim.wo[M.code_win].winbar = text
 end
 
@@ -112,6 +116,7 @@ local function preview(e, force)
     vim.cmd("silent! keepalt edit " .. vim.fn.fnameescape(e.path))
     vim.bo.modifiable = false
   end)
+  if M.update_markers then M.update_markers(e) end
   set_code_winbar(e)
 end
 
@@ -202,6 +207,85 @@ local function base_for(e, kind)
     return nil, "no snapshot of the agent's starting point and no committed version"
   end
   return nil, "no committed version (new file, no commits yet or not in git)"
+end
+
+-- Change markers ----------------------------------------------------------
+-- Signs on the lines that differ from the agent's starting point (or HEAD),
+-- and ]c / [c to jump between those changes without opening the diff.
+
+local ns = vim.api.nvim_create_namespace("agent-edits")
+local MAX_DIFF_BYTES = 2000000
+local diff_fn = (vim.text and vim.text.diff) or vim.diff
+M.hunks, M.stats = {}, {}
+
+function M.update_markers(e)
+  if not (e and vim.api.nvim_win_is_valid(M.code_win)) then return end
+  local buf = vim.api.nvim_win_get_buf(M.code_win)
+  if vim.api.nvim_buf_get_name(buf) ~= e.path then return end
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  vim.wo[M.code_win].signcolumn = "yes:1"
+  M.hunks[e.path], M.stats[e.path] = {}, { add = 0, change = 0, delete = 0 }
+
+  local base = base_for(e, "agent")
+  if not base then return end
+  local old = table.concat(base, "\n") .. "\n"
+  local new = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") .. "\n"
+  if #old > MAX_DIFF_BYTES or #new > MAX_DIFF_BYTES then return end
+  local ok, hunks = pcall(diff_fn, old, new, { result_type = "indices" })
+  if not ok or type(hunks) ~= "table" then return end
+
+  local last = vim.api.nvim_buf_line_count(buf)
+  local function sign(line, text, hl)
+    line = math.max(1, math.min(line, last))
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns, line - 1, 0,
+      { sign_text = text, sign_hl_group = hl, priority = 20 })
+  end
+  local st = M.stats[e.path]
+  for _, h in ipairs(hunks) do
+    local _, count_a, start_b, count_b = unpack(h)
+    if count_b == 0 then
+      -- Deleted lines: mark the line after which they were.
+      st.delete = st.delete + count_a
+      sign(start_b == 0 and 1 or start_b, start_b == 0 and "▔" or "▁", "Removed")
+      table.insert(M.hunks[e.path], math.max(start_b, 1))
+    else
+      local kind, hl = "add", "Added"
+      if count_a > 0 then kind, hl = "change", "Changed" end
+      st[kind] = st[kind] + count_b
+      for l = start_b, start_b + count_b - 1 do sign(l, "▎", hl) end
+      table.insert(M.hunks[e.path], start_b)
+    end
+  end
+end
+
+-- Jump to the next (dir 1) or previous (dir -1) change in the code window.
+local function jump_change(dir)
+  if vim.wo.diff then
+    vim.cmd("normal! " .. (dir > 0 and "]c" or "[c"))
+    return
+  end
+  local starts = M.current and M.hunks[M.current] or {}
+  if #starts == 0 then
+    vim.notify("agent-edits: no changes in this file")
+    return
+  end
+  vim.api.nvim_set_current_win(M.code_win)
+  local cur = vim.api.nvim_win_get_cursor(M.code_win)[1]
+  local target, index
+  if dir > 0 then
+    for i, l in ipairs(starts) do
+      if l > cur then target, index = l, i break end
+    end
+    target, index = target or starts[1], index or 1
+  else
+    for i = #starts, 1, -1 do
+      if starts[i] < cur then target, index = starts[i], i break end
+    end
+    target, index = target or starts[#starts], index or #starts
+  end
+  vim.api.nvim_win_set_cursor(M.code_win, { target, 0 })
+  vim.cmd("normal! zz")
+  vim.api.nvim_echo({ { string.format("change %d/%d", index, #starts) } }, false, {})
 end
 
 local function toggle_diff(kind)
@@ -309,6 +393,7 @@ local HELP = {
   "   Ctrl-h / Ctrl-l   move between list and code",
   "   D                 diff: what the agent changed (toggle)",
   "   gD                diff against HEAD (toggle)",
+  "   ]c / [c           next / previous change (signs in the margin)",
   "   Ctrl-z            hide the popup (prefix + e brings it back)",
   "   :q  ZZ  ZQ        quit the viewer",
   "",
@@ -371,6 +456,8 @@ local function setup()
   map("[f", function() move(-1) end)
   map("D", function() toggle_diff("agent") end)
   map("gD", function() toggle_diff("head") end)
+  map("]c", function() jump_change(1) end)
+  map("[c", function() jump_change(-1) end)
   map("<C-h>", "<cmd>wincmd h<cr>")
   map("<C-l>", "<cmd>wincmd l<cr>")
 
@@ -387,6 +474,19 @@ local function setup()
 
   vim.api.nvim_create_user_command("AgentEditsHelp", show_help, { desc = "agent-edits key bindings" })
   map("g?", show_help)
+
+  -- Keep the markers in step when checktime reloads a file the agent changed.
+  vim.api.nvim_create_autocmd("BufReadPost", {
+    callback = function(args)
+      local e = selected()
+      if e and args.file ~= "" and vim.fn.fnamemodify(args.file, ":p") == e.path then
+        vim.schedule(function()
+          M.update_markers(e)
+          set_code_winbar(e)
+        end)
+      end
+    end,
+  })
 
   vim.api.nvim_create_autocmd("CursorMoved", {
     buffer = M.list_buf,
