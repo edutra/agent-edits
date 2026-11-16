@@ -184,14 +184,26 @@ def prune():
         pass
 
 
+def tmux_pane():
+    """The tmux pane the agent runs in, as "<server pid>:<pane id>" (pane ids
+    start again from %0 when the tmux server restarts), or "-" outside tmux.
+    The agent passes its environment on to the hook."""
+    server, pane = os.environ.get("TMUX", ""), os.environ.get("TMUX_PANE", "")
+    parts = server.split(",")
+    if len(parts) < 2 or not parts[1].isdigit() or not pane.startswith("%"):
+        return "-"
+    return f"{parts[1]}:{pane}"
+
+
 def log_edits(event, paths, cwd, via="tool"):
     agent = agent_name(event)
     project = project_dir(event, cwd)
     session = session_id(event)
+    pane = tmux_pane()
     now = int(time.time())
     with open(LOG, "a", encoding="utf-8") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\t{session}\t{via}\n" for p in paths)
+        fh.writelines(f"{now}\t{agent}\t{p}\t{project}\t{session}\t{via}\t{pane}\n" for p in paths)
         prune()
 
 

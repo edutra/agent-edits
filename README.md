@@ -2,8 +2,10 @@
 
 See every file your AI coding agents edited, in a tmux popup with full Vim motions.
 
-Press `prefix + e` in any tmux pane, and a floating Neovim window opens with every file that
-**Claude Code**, **Codex** or **Grok** edited, in any project. Git is not required. The newest
+Press `prefix + e` in any tmux window, and a floating Neovim window opens with every file that
+the **Claude Code**, **Codex** or **Grok** agents running in that tmux window edited. Each tmux
+window (tab) has its own list: switch windows and you see the files of the agents there. Git is
+not required. The newest
 edits are at the top, grouped by folder. Moving through the list previews each file read-only, and the preview
 follows the agent live while it works. Select lines and press `y` or `d` to paste them into the
 agent's prompt.
@@ -29,9 +31,9 @@ agent's prompt.
      this copy to show exactly what the session changed.
    - for **shell commands** (`Bash` and the equivalents in Codex and Grok), it records the files
      that changed under the command's directory while the command ran (see Limitations).
-   - **after** the call (`PostToolUse`), it appends `timestamp  agent  path  project  session  via`
+   - **after** the call (`PostToolUse`), it appends `timestamp  agent  path  project  session  via  pane`
      to `~/.local/state/agent-edits/edits.tsv`. `project` is the directory the agent session was
-     started in.
+     started in, and `pane` the tmux pane the agent runs in (from `$TMUX_PANE`, `-` outside tmux).
    - **Claude Code**: `Edit`, `Write`, `MultiEdit`, `NotebookEdit` (in `~/.claude/settings.json`).
    - **Grok**: Grok also loads the hooks in `~/.claude/settings.json`, so the same entry covers it.
      Edits are tagged `Grok`.
@@ -39,10 +41,11 @@ agent's prompt.
      Codex runs the hook only after you trust it with `/hooks` (see Troubleshooting).
 2. The tmux binding runs `agent-edits-popup --open` through `run-shell`, because `display-popup`
    does not expand `#{formats}` in its command. That opens a `display-popup` running `agent-edits-popup`. That script keeps one
-   viewer per directory alive in a private tmux server (`tmux -L agent-edits`). The first press
-   starts the viewer, and later presses re-attach to it, so hiding the popup keeps its state.
-3. `agent-edits-view` starts Neovim with `nvim/viewer.lua` in that directory. Every logged file
-   is listed under its folder, and you can filter the list by agent, session or project. A path
+   viewer per tmux window alive in a private tmux server (`tmux -L agent-edits`). The first press
+   in a window starts its viewer, and later presses re-attach to it, so hiding the popup keeps its
+   state. A viewer ends when its window is closed.
+3. `agent-edits-view` starts Neovim with `nvim/viewer.lua` in the pane's directory. Every file
+   edited from one of the window's panes is listed under its folder (`w` lists every window's), and you can filter the list by agent, session or project. A path
    is shown relative to the editing session's project, or to the directory, or as `~/...`.
    The list refreshes every 2 seconds.
 4. The binding also passes the pane's id to the viewer. Selected code is pasted into that pane
@@ -99,8 +102,8 @@ Environment overrides: `AGENT_EDITS_BIN_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME
 
 ## Usage
 
-Press `prefix + e` inside the pane where the agent is running. If a viewer for that directory
-is already running in the background, the same key brings it back as you left it.
+Press `prefix + e` inside the tmux window where the agent is running. If that window's viewer is
+already running in the background, the same key brings it back as you left it.
 
 | Key | Where | Action |
 |-----|-------|--------|
@@ -111,6 +114,7 @@ is already running in the background, the same key brings it back as you left it
 | `zR` / `zM` | list | Open / close every folder and session |
 | `f` | list | Folder tree (toggle, on by default). Files are listed under their folders, which nest and fold. Every folder and session starts folded: open what you want to see with `l`, or everything with `zR`. A folder with only one subfolder is shown as one row (`src/api/`). Folders are ordered by their newest edit, and each header shows how many files it holds. When the files come from several projects, each project is a top-level folder. With `f` off, each row shows the whole path, the folder dimmed. |
 | `t` | list | Group the list by agent session (toggle). Each group has a header with the agent, the project, the number of files and the last edit. A file edited by two sessions appears in both groups. Inside a session the files are in a folder tree too. |
+| `w` | list | Only the files the agents of this tmux window edited (default), or every window's (toggle). A file edited from two windows shows up in both. |
 | `r` | list | Reload the list now |
 | `a` | list | Filter by agent: all, Claude, Codex, Grok (only the agents in the log) |
 | `s` | list | Show only the session that edited the selected file (toggle) |
@@ -168,6 +172,9 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
   Inside git, committed files a command deletes (`rm`, `git rm`) are recorded too, with their
   `HEAD` version as the snapshot. Deleting untracked files, or files outside git, is not seen.
 - Only edits made after you install the hook are recorded.
+- Edits logged before the hook recorded the tmux pane, and edits by agents running outside tmux,
+  belong to no window: `w` shows them. An agent moved to another window (`join-pane`) takes its
+  edits along; a tmux server restart starts every window empty.
 - `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
 - A file that no longer exists stays in the list, struck through and marked `✗`, when there is a
   snapshot of what it held: `D` shows it. Files an agent created and then removed again
