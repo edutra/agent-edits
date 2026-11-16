@@ -77,6 +77,33 @@ class PopupTests(unittest.TestCase):
                       "the popup to attach")
         self.assertEqual(self.inner_sessions(), [self.session])
 
+    def viewer_pid(self):
+        return self.tmux("-L", "agent-edits", "list-panes", "-t", self.session + ":", "-F", "#{pane_pid}").stdout.strip()
+
+    def test_restarts_when_the_viewer_changed(self):
+        viewer = os.path.join(self.tmp, "viewer.lua")
+        shutil.copy(os.path.join(REPO, "nvim", "viewer.lua"), viewer)
+        self.env["AGENT_EDITS_VIEWER"] = viewer
+        self.open_popup("first")
+        self.wait_for(lambda: "Edits (0)" in self.viewer_screen(), "the viewer to draw")
+        pid = self.viewer_pid()
+
+        # Same code: the same viewer comes back.
+        self.tmux("-L", "outer", "kill-session", "-t", "first")
+        self.open_popup("second")
+        self.wait_for(lambda: self.tmux("-L", "agent-edits", "list-clients").stdout.strip() != "",
+                      "the popup to attach")
+        self.assertEqual(self.viewer_pid(), pid)
+
+        # Updated code (git pull): a new viewer runs it.
+        self.tmux("-L", "outer", "kill-session", "-t", "second")
+        with open(viewer, "a") as fh:
+            fh.write("-- updated\n")
+        self.open_popup("third")
+        self.wait_for(lambda: self.viewer_pid() not in ("", pid), "a new viewer")
+        self.wait_for(lambda: "Edits (0)" in self.viewer_screen(), "the new viewer to draw")
+        self.assertEqual(self.inner_sessions(), [self.session])
+
 
 if __name__ == "__main__":
     unittest.main()
