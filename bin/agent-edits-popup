@@ -33,11 +33,22 @@ server=(tmux -L agent-edits)
 prefix="$(tmux show-options -gv prefix 2>/dev/null || echo C-b)"
 unset TMUX
 
-session="ae-$(printf '%s' "$root" | md5sum | cut -c1-12)"
+# md5sum on Linux, md5 on macOS (which has no md5sum).
+if command -v md5sum >/dev/null; then digest=(md5sum); else digest=(md5 -q); fi
+session="ae-$(printf '%s' "$root" | "${digest[@]}" | cut -c1-12)"
+# A viewer started before the viewer's code changed (git pull, install.sh)
+# would keep running the old code: start a new one instead.
+viewer="${AGENT_EDITS_VIEWER:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-edits/viewer.lua}"
+version="$(cat "$viewer" "$here/agent-edits-view" 2>/dev/null | "${digest[@]}" | cut -c1-12)"
+if "${server[@]}" has-session -t "=$session" 2>/dev/null &&
+  [[ "$("${server[@]}" show-options -qv -t "$session" @ae_version 2>/dev/null)" != "$version" ]]; then
+  "${server[@]}" kill-session -t "=$session"
+fi
 if ! "${server[@]}" has-session -t "=$session" 2>/dev/null; then
   "${server[@]}" new-session -d -s "$session" -c "$root" \
     -x "$(tput cols)" -y "$(tput lines)" -e AGENT_EDITS_POPUP=1 \
     "$here/agent-edits-view" "$root"
+  "${server[@]}" set-option -t "$session" @ae_version "$version"
 fi
 "${server[@]}" set-option -g prefix "$prefix" \; bind-key "$key" detach-client
 # Where to send snippets; updated on every open, since the same viewer can be

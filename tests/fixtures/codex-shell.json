@@ -1,0 +1,1 @@
+{"session_id": "codex-session-1", "cwd": "@CWD@", "hook_event_name": "@EVENT@", "tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "@COMMAND@"], "workdir": "@WORKDIR@"}, "tool_use_id": "@CALL@"}
