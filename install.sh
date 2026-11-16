@@ -47,29 +47,33 @@ say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Files this run created ("|file|..."): they had nothing worth a backup.
-created="|"
+# Files this run created or already backed up ("|file|..."): the first backup
+# holds the original, and a created file had nothing worth keeping.
+seen="|"
 
 # patch FILE CMD...: run CMD (which edits FILE) and keep a timestamped backup
-# of FILE only when CMD actually changed it.
+# of FILE only when CMD actually changed it, once per run.
 patch() {
   local file="$1" tmp=""
   shift
-  if [[ ! -e "$file" ]]; then
-    created+="$file|"
-  elif [[ "$created" != *"|$file|"* ]]; then
-    tmp="$(mktemp)"
-    cp -p "$file" "$tmp"
+  if [[ "$seen" != *"|$file|"* ]]; then
+    seen+="$file|"
+    if [[ -e "$file" ]]; then
+      tmp="$(mktemp)"
+      cp -p "$file" "$tmp"
+    fi
   fi
   "$@"
   if [[ -n "$tmp" ]]; then
     if cmp -s "$tmp" "$file"; then
       rm -f "$tmp"
+      # Unchanged so far: a later call may still change it.
+      seen="${seen/|$file|/|}"
     else
       local dest
       dest="$file.bak-agent-edits-$(date +%Y%m%d-%H%M%S)"
       if [[ -e "$dest" ]]; then
-        # Already backed up this run (same second): that copy is the original.
+        # An earlier run in the same second: its copy is the older one.
         rm -f "$tmp"
       else
         mv "$tmp" "$dest"
