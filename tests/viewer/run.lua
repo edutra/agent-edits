@@ -10,6 +10,8 @@ local state = vim.env.XDG_STATE_HOME .. "/agent-edits"
 local log_file = state .. "/edits.tsv"
 local NOW = os.time()
 local tests = {}
+-- The viewer's fold_default when it started, before any test changed it.
+local started_folded
 
 local function test(name, fn) tests[#tests + 1] = { name = name, fn = fn } end
 local function V() return package.loaded["agent-edits"] end
@@ -63,6 +65,35 @@ local function baseline(session, rel, text)
 end
 
 local function lines() return vim.api.nvim_buf_get_lines(V().list_buf, 0, -1, false) end
+
+-- The file rows' entries, top to bottom.
+-- 
+local function entries()
+  local out = {}
+  for _, row in ipairs(V().rows) do
+    if row.entry then out[#out + 1] = row.entry end
+  end
+  return out
+end
+
+-- The text of the file row named `rel`.
+local function row_text(rel)
+  for i, row in ipairs(V().rows) do
+    if row.entry and row.entry.rel == rel then return lines()[i] end
+  end
+  error("no row for " .. rel, 2)
+end
+
+-- Every row, top to bottom: "[agent]" for a session, "dir/" for a folder,
+-- the file's name for a file.
+local function kinds()
+  local out = {}
+  for _, row in ipairs(V().rows) do
+    out[#out + 1] = row.group and ("[" .. row.group.agent .. "]")
+      or row.folder and (row.folder.label .. "/") or row.entry.rel
+  end
+  return out
+end
 
 -- The displayed name of each file row, top to bottom.
 local function names()
@@ -124,7 +155,8 @@ end
 -- Back to a clean slate between tests.
 local function reset()
   keys("F")
-  V().grouped, V().folded = false, {}
+  -- Unfolded, so the rows show; "everything starts folded" has its own test.
+  V().grouped, V().folders, V().folded, V().fold_default = false, true, {}, false
   V().confirm = function() return true end
   vim.fn.delete(state .. "/baselines", "rf")
   vim.fn.delete(state .. "/reverted", "rf")
@@ -143,14 +175,14 @@ test("newest first, names relative to the project", function()
   file("a.txt") file("sub/b.txt") file("c.txt")
   log({ { 30, "Claude", "a.txt" }, { 10, "Codex", "sub/b.txt" }, { 20, "Grok", "c.txt" } })
   eq(names(), { "sub/b.txt", "c.txt", "a.txt" }, "rows")
-  has(lines()[1], "Codex", "first row")
+  has(row_text("sub/b.txt"), "Codex", "first row")
 end)
 
 test("one row per file, from its latest edit", function()
   file("a.txt")
   log({ { 30, "Claude", "a.txt" }, { 10, "Codex", "a.txt" } })
   eq(names(), { "a.txt" }, "rows")
-  eq(V().rows[1].entry.agent, "Codex", "agent")
+  eq(entries()[1].agent, "Codex", "agent")
 end)
 
 test("old log lines with three columns", function()
@@ -160,13 +192,13 @@ test("old log lines with three columns", function()
   write(log_file, (NOW - 5) .. "\tClaude\t" .. abs("old.txt") .. "\n")
   refresh()
   eq(names(), { "old.txt" }, "rows")
-  eq(V().rows[1].entry.session, "-", "session")
+  eq(entries()[1].session, "-", "session")
 end)
 
 test("shell edits are marked with $", function()
   file("s.txt")
   log({ { 5, "Claude", "s.txt", via = "shell" } })
-  has(lines()[1], "Claude$", "row")
+  has(row_text("s.txt"), "Claude$", "row")
 end)
 
 test("missing files without a baseline are hidden", function()
@@ -179,9 +211,9 @@ test("deleted files with a baseline are listed", function()
   baseline("s1", "gone.txt", "a\nb\n")
   log({ { 5, "Claude", "gone.txt" } })
   eq(names(), { "gone.txt" }, "rows")
-  local e = V().rows[1].entry
+  local e = entries()[1]
   eq(e.deleted, true, "deleted")
-  has(lines()[1], "✗", "row")
+  has(row_text("gone.txt"), "✗", "row")
   select("gone.txt")
   eq(V().stats[e.path], { add = 0, change = 0, delete = 2 }, "stats")
 end)
@@ -234,7 +266,7 @@ test("p keeps this project", function()
   keys("p")
   eq(#names(), 2, "rows in the project")
   for _, row in ipairs(V().rows) do
-    if row.entry.path == other .. "/out.txt" then error("out.txt is not in the project") end
+    if row.entry and row.entry.path == other .. "/out.txt" then error("out.txt is not in the project") end
   end
 end)
 
@@ -252,14 +284,14 @@ test("x marks reviewed, a new edit brings the file back", function()
   select("a.txt")
   keys("x")
   eq(names(), { "b.txt", "a.txt" }, "reviewed file sinks")
-  has(lines()[2], "✓", "reviewed row")
+  has(row_text("a.txt"), "✓", "reviewed row")
   keys("X")
   eq(names(), { "b.txt" }, "X hides reviewed")
   keys("X")
   append(line({ 0, "Claude", "a.txt" }))
   refresh()
   eq(names(), { "a.txt", "b.txt" }, "edited again")
-  eq(V().rows[1].entry.reviewed, false, "reviewed")
+  eq(entries()[1].reviewed, false, "reviewed")
 end)
 
 test("t groups by session", function()
@@ -267,10 +299,123 @@ test("t groups by session", function()
   log({ { 10, "Claude", "a.txt", session = "one" }, { 20, "Codex", "b.txt", session = "two" },
     { 30, "Claude", "c.txt", session = "one" } })
   keys("t")
-  local kinds = {}
-  for _, row in ipairs(V().rows) do kinds[#kinds + 1] = row.group and ("[" .. row.group.agent .. "]") or row.entry.rel end
-  eq(kinds, { "[Claude]", "a.txt", "c.txt", "[Codex]", "b.txt" }, "rows")
+  eq(kinds(), { "[Claude]", "a.txt", "c.txt", "[Codex]", "b.txt" }, "rows")
   keys("t")
+end)
+
+test("files are grouped by folder, newest first", function()
+  file("top.txt") file("src/api/a.ts") file("src/api/b.ts") file("lib/c.lua")
+  log({ { 40, "Claude", "top.txt" }, { 30, "Claude", "src/api/a.ts" }, { 10, "Codex", "lib/c.lua" },
+    { 20, "Claude", "src/api/b.ts" } })
+  eq(kinds(), { "lib/", "lib/c.lua", "src/api/", "src/api/b.ts", "src/api/a.ts", "top.txt" }, "rows")
+  -- Under its folder a file shows its name only.
+  local text = row_text("src/api/b.ts")
+  eq(text:find("src/api", 1, true), nil, "folder repeated in " .. text)
+  has(text, "b.ts", "file row")
+  has(lines()[3], "src/api/", "folder row")
+  keys("f")
+  eq(names(), { "lib/c.lua", "src/api/b.ts", "src/api/a.ts", "top.txt" }, "rows without folders")
+  has(row_text("src/api/b.ts"), "src/api/b.ts", "full name")
+end)
+
+test("folders nest, a folder with one subfolder is one row", function()
+  file("src/tui/data.rs") file("src/tui/ui.rs") file("src/commands/trip.rs") file("src/main.rs")
+  log({ { 10, "Claude", "src/tui/data.rs" }, { 20, "Claude", "src/commands/trip.rs" },
+    { 30, "Claude", "src/tui/ui.rs" }, { 40, "Claude", "src/main.rs" } })
+  eq(kinds(), { "src/", "tui/", "src/tui/data.rs", "src/tui/ui.rs", "commands/", "src/commands/trip.rs",
+    "src/main.rs" }, "rows")
+  eq(V().rows[2].depth, 1, "depth of tui/")
+  has(lines()[1], "4", "file count of src/")
+end)
+
+test("folders fold and unfold: za, h / l, zc / zo, zM / zR", function()
+  file("x/one.txt") file("x/deep/two.txt") file("y/three.txt")
+  log({ { 10, "Claude", "x/one.txt" }, { 20, "Claude", "x/deep/two.txt" }, { 30, "Claude", "y/three.txt" } })
+  local function cur() return vim.api.nvim_win_get_cursor(V().list_win)[1] end
+  eq(kinds(), { "x/", "x/one.txt", "deep/", "x/deep/two.txt", "y/", "y/three.txt" }, "rows")
+  -- j / k stop on folders, so a folded one can be reached and opened again.
+  keys("gg")
+  eq(cur(), 1, "gg")
+  keys("jj")
+  eq(kinds()[cur()], "deep/", "j stops on a folder")
+  keys("za")
+  eq(kinds(), { "x/", "x/one.txt", "deep/", "y/", "y/three.txt" }, "za folds")
+  has(lines()[3], "▸", "folded mark")
+  keys("za")
+  eq(#kinds(), 6, "za unfolds")
+  -- h on a file folds its folder and leaves the cursor on it.
+  keys("j")
+  eq(kinds()[cur()], "x/deep/two.txt", "on the file")
+  keys("h")
+  eq(kinds(), { "x/", "x/one.txt", "deep/", "y/", "y/three.txt" }, "h folds the parent")
+  eq(cur(), 3, "cursor on the folder")
+  keys("h")
+  eq(kinds(), { "x/", "y/", "y/three.txt" }, "h again folds the folder above")
+  eq(cur(), 1, "cursor on x/")
+  keys("l")
+  eq(kinds(), { "x/", "x/one.txt", "deep/", "y/", "y/three.txt" }, "l opens, deep/ stays folded")
+  keys("l")
+  eq(cur(), 2, "l on an open folder goes in")
+  keys("zc")
+  eq(kinds(), { "x/", "y/", "y/three.txt" }, "zc on a file folds its folder")
+  keys("zo")
+  eq(#kinds(), 5, "zo")
+  keys("zM")
+  eq(kinds(), { "x/", "y/" }, "zM")
+  keys("zR")
+  eq(#kinds(), 6, "zR")
+end)
+
+test("everything starts folded", function()
+  eq(started_folded, true, "fold_default at start")
+  file("a/one.txt") file("a/b/two.txt") file("top.txt")
+  log({ { 10, "Claude", "a/one.txt" }, { 20, "Claude", "a/b/two.txt" }, { 30, "Claude", "top.txt" } })
+  keys("zM")
+  eq(kinds(), { "a/", "top.txt" }, "folded")
+  keys("gg")
+  keys("l")
+  eq(kinds(), { "a/", "a/one.txt", "b/", "top.txt" }, "a subfolder starts folded too")
+  keys("t")
+  for _, row in ipairs(V().rows) do
+    if not row.group then error("a session is not folded") end
+  end
+  keys("t")
+end)
+
+test("x on a folder marks every file in it", function()
+  file("d/a.txt") file("d/b.txt") file("e.txt")
+  log({ { 10, "Claude", "d/a.txt" }, { 20, "Claude", "d/b.txt" }, { 5, "Claude", "e.txt" } })
+  eq(kinds()[1], "e.txt", "newest first")
+  vim.api.nvim_win_set_cursor(V().list_win, { 2, 0 })
+  keys("x")
+  local reviewed = {}
+  for _, e in ipairs(entries()) do reviewed[e.rel] = e.reviewed end
+  eq(reviewed, { ["d/a.txt"] = true, ["d/b.txt"] = true, ["e.txt"] = false }, "reviewed")
+  eq(kinds()[vim.api.nvim_win_get_cursor(V().list_win)[1]], "d/", "cursor stays on the folder")
+end)
+
+test("files from several projects are grouped by project", function()
+  local other = vim.fn.fnamemodify(root, ":h") .. "/other"
+  file("src/in.txt")
+  write(other .. "/src/out.txt")
+  log({ { 10, "Claude", "src/in.txt" }, { 20, "Claude", other .. "/src/out.txt", project = other } })
+  local here, there = vim.fn.fnamemodify(root, ":~"), vim.fn.fnamemodify(other, ":~")
+  eq(kinds(), { here .. "/", "src/", "src/in.txt", there .. "/", "src/", "src/out.txt" }, "rows")
+  keys("p")
+  eq(kinds(), { "src/", "src/in.txt" }, "one project")
+end)
+
+test("long names are shortened from the start", function()
+  local long = "a-very-long-directory-name/with/more/levels/than/fit/file.txt"
+  file(long)
+  log({ { 5, "Claude", long } })
+  local width = vim.api.nvim_win_get_width(V().list_win) - 1
+  for i, l in ipairs(lines()) do
+    eq(vim.fn.strdisplaywidth(l), width, "width of line " .. i)
+  end
+  has(lines()[1], "…", "folder row")
+  keys("f")
+  has(row_text(long), "file.txt", "flat row keeps the file name")
 end)
 
 test("the log is read as it grows and again when it shrinks", function()
@@ -469,6 +614,7 @@ end)
 -- Runner ------------------------------------------------------------------------
 
 local function run()
+  started_folded = V().fold_default
   local failed = 0
   for _, t in ipairs(tests) do
     reset()

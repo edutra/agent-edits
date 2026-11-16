@@ -16,7 +16,6 @@ local reviewed_file = state_dir .. "/reviewed.tsv"
 local this_file = vim.fn.resolve(debug.getinfo(1, "S").source:sub(2))
 local log_cmd = vim.fn.fnamemodify(this_file, ":h:h") .. "/bin/agent-edits-log"
 if vim.fn.executable(log_cmd) == 0 then log_cmd = vim.fn.exepath("agent-edits-log") end
-local LIST_WIDTH = 40
 
 vim.o.swapfile = false
 vim.o.shadafile = "NONE"
@@ -44,15 +43,16 @@ end
 -- Every logged file is listed, from any project. A file shows a path relative
 -- to the project of the session that edited it, else to the directory the
 -- viewer was opened in, else ~/... A session started in $HOME or / has no
--- project worth naming.
+-- project worth naming. Returns the name and the directory it is relative
+-- to ("" for ~/...).
 local function display_name(path, project)
   if project == vim.env.HOME or project == "/" then project = "" end
   for _, base in ipairs({ project or "", root }) do
     if base ~= "" and base ~= "/" and path ~= base and under(path, base) then
-      return path:sub(#base + 2)
+      return path:sub(#base + 2), base
     end
   end
-  return vim.fn.fnamemodify(path, ":~")
+  return vim.fn.fnamemodify(path, ":~"), ""
 end
 
 -- Files still to review first, then the reviewed ones; newest first within each.
@@ -116,9 +116,10 @@ local function read_log()
     local ts, path = tonumber(f[1]), f[3]
     if ts and path and path ~= "" then
       local e = {
-        ts = ts, agent = f[2], path = path, rel = display_name(path, f[4]),
+        ts = ts, agent = f[2], path = path,
         project = f[4] or "", session = f[5] or "-", via = f[6] or "tool",
       }
+      e.rel, e.base = display_name(path, f[4])
       if not c.latest[path] or c.latest[path].ts <= ts then c.latest[path] = e end
       local key = e.session .. "\0" .. path
       if not c.per_session[key] or c.per_session[key].ts <= ts then c.per_session[key] = e end
@@ -349,20 +350,101 @@ local function preview(e, force)
   set_code_winbar(e)
 end
 
--- Session groups ------------------------------------------------------------
--- t toggles the grouped view: one header per agent session, its files below.
+-- Session groups and the folder tree -------------------------------------------
+-- t toggles the session view: one header per agent session, its files below.
+-- f toggles the folder tree (on by default). Folders and sessions fold.
 
-M.grouped, M.folded = false, {}
+-- folded: what was folded or unfolded by hand; any other folder or session
+-- follows fold_default (zM / zR set it). Everything starts folded.
+M.grouped, M.folders, M.folded, M.fold_default = false, true, {}, true
 local list_ns = vim.api.nvim_create_namespace("agent-edits-list")
+
+local function is_folded(key)
+  if M.folded[key] == nil then return M.fold_default end
+  return M.folded[key]
+end
 
 local function group_key(e)
   return e.session ~= "-" and e.session or (e.agent .. "|" .. e.project)
 end
 
+-- items: the subfolders ({ folder = f }) and files ({ entry = e }) in list
+-- order; files: every file below the folder.
+local function new_folder(key, label, path)
+  return { key = key, label = label, path = path, items = {}, subs = {}, files = {} }
+end
+
+-- A folder with nothing but one subfolder becomes one row: "src/api/".
+local function compact(f)
+  while not f.project and #f.items == 1 and f.items[1].folder do
+    local sub = f.items[1].folder
+    f.label, f.key, f.path, f.items = f.label .. "/" .. sub.label, sub.key, sub.path, sub.items
+  end
+  for _, item in ipairs(f.items) do
+    if item.folder then compact(item.folder) end
+  end
+end
+
+-- The folder tree of `files` (already sorted). A folder comes where its first
+-- file would, so the newest edits and the files still to review stay on top.
+-- When the files come from several projects, each project is a folder.
+local function folder_tree(files, scope)
+  local top = new_folder(scope, "", "")
+  local bases, projects = {}, 0
+  for _, e in ipairs(files) do
+    if not bases[e.base] then bases[e.base], projects = true, projects + 1 end
+  end
+  for _, e in ipairs(files) do
+    local node = top
+    local function enter(key, label, path)
+      if not node.subs[key] then
+        node.subs[key] = new_folder(scope .. "\0" .. key, label, path)
+        node.items[#node.items + 1] = { folder = node.subs[key] }
+      end
+      node = node.subs[key]
+      table.insert(node.files, e)
+    end
+    table.insert(top.files, e)
+    if projects > 1 then
+      enter("project\0" .. e.base, e.base ~= "" and vim.fn.fnamemodify(e.base, ":~") or "elsewhere", e.base)
+      node.project = true
+    end
+    local parts = vim.split(e.rel, "/", { plain = true })
+    local dir = e.base
+    for i = 1, #parts - 1 do
+      -- ~/... and /... names: the first part is "~" or "" (the root).
+      dir = dir == "" and (parts[i] == "" and "/" or vim.fs.normalize(parts[i]))
+        or (dir:sub(-1) == "/" and dir or dir .. "/") .. parts[i]
+      enter(e.base .. "\0" .. dir, parts[i], dir)
+    end
+    node.items[#node.items + 1] = { entry = e }
+  end
+  for _, item in ipairs(top.items) do
+    if item.folder then compact(item.folder) end
+  end
+  return top
+end
+
+local function tree_rows(rows, f, depth)
+  for _, item in ipairs(f.items) do
+    if item.entry then
+      rows[#rows + 1] = { entry = item.entry, depth = depth, short = true }
+    else
+      rows[#rows + 1] = { folder = item.folder, depth = depth }
+      if not is_folded(item.folder.key) then tree_rows(rows, item.folder, depth + 1) end
+    end
+  end
+end
+
+local function file_rows(rows, files, depth, scope)
+  if M.folders then return tree_rows(rows, folder_tree(files, scope), depth) end
+  for _, e in ipairs(files) do rows[#rows + 1] = { entry = e, depth = depth } end
+end
+
 local function build_rows(entries, per_session)
   local rows = {}
   if not M.grouped then
-    for _, e in ipairs(entries) do rows[#rows + 1] = { entry = e } end
+    file_rows(rows, entries, 0, "")
     return rows
   end
   -- per_session is sorted newest first, so groups come out newest first too.
@@ -376,25 +458,94 @@ local function build_rows(entries, per_session)
     table.insert(groups[key].files, e)
   end
   for _, g in ipairs(order) do
-    rows[#rows + 1] = { group = g }
-    if not M.folded[g.key] then
-      for _, e in ipairs(g.files) do rows[#rows + 1] = { entry = e } end
-    end
+    rows[#rows + 1] = { group = g, depth = 0 }
+    if not is_folded(g.key) then file_rows(rows, g.files, 1, g.key) end
   end
   return rows
 end
 
--- "<left><padding><right>" in exactly `width` cells, cutting `left` from the start.
-local function fit(left, right, width)
-  local room = width - vim.fn.strdisplaywidth(right)
-  if vim.fn.strdisplaywidth(left) > room then
-    left = "…" .. vim.fn.strcharpart(left, vim.fn.strchars(left) - (room - 1))
+-- One list line of exactly `width` cells. `left` and `right` are lists of
+-- { text, hl } chunks; `right` is aligned to the right edge. When the line is
+-- too long, the chunks marked `cut` are shortened from the start, in order.
+-- Returns the text and the highlights as { start byte, end byte, hl, keep }.
+local function compose(left, right, width)
+  local function cells(chunks)
+    local n = 0
+    for _, c in ipairs(chunks) do n = n + vim.fn.strdisplaywidth(c[1]) end
+    return n
   end
-  return left .. string.rep(" ", room - vim.fn.strdisplaywidth(left)) .. right
+  local over = cells(left) + cells(right) - width
+  for _, c in ipairs(left) do
+    if over <= 0 then break end
+    local w = vim.fn.strdisplaywidth(c[1])
+    if c.cut and w > 0 then
+      if w - over >= 1 then
+        c[1] = "…" .. vim.fn.strcharpart(c[1], vim.fn.strchars(c[1]) - (w - over - 1))
+        over = 0
+      else
+        c[1], over = "", over - w
+      end
+    end
+  end
+  local chunks = vim.list_extend({}, left)
+  chunks[#chunks + 1] = { string.rep(" ", math.max(width - cells(left) - cells(right), 0)) }
+  vim.list_extend(chunks, right)
+  local text, spans = "", {}
+  for _, c in ipairs(chunks) do
+    if c[2] and c[1] ~= "" then spans[#spans + 1] = { #text, #text + #c[1], c[2], c.keep } end
+    text = text .. c[1]
+  end
+  return text, spans
+end
+
+local function agent_hl(agent)
+  return vim.fn.hlexists("AgentEdits" .. agent) == 1 and ("AgentEdits" .. agent) or "AgentEditsAgent"
+end
+
+-- The chunks of one row (see compose), and the highlight of the whole line.
+local function row_chunks(row)
+  local indent = { string.rep(" ", 1 + 2 * row.depth) }
+  if row.group then
+    local g = row.group
+    local where = g.project ~= "" and vim.fn.fnamemodify(g.project, ":~") or "?"
+    return { indent, { (is_folded(g.key) and "▸" or "▾") .. " ", "AgentEditsFoldMark" },
+      { g.agent, agent_hl(g.agent) }, { " " .. where, cut = true } },
+      { { string.format(" %d %3s", #g.files, ago(g.ts)), "AgentEditsMeta" } }, "Title"
+  end
+  if row.folder then
+    local f, todo = row.folder, 0
+    for _, e in ipairs(f.files) do
+      if not e.reviewed then todo = todo + 1 end
+    end
+    return { indent, { (is_folded(f.key) and "▸" or "▾") .. " ", "AgentEditsFoldMark" },
+      { f.label .. "/", f.project and "Title" or "AgentEditsFolder", cut = true } },
+      { { " " .. #f.files, "AgentEditsMeta" } }, todo == 0 and "Comment" or nil
+  end
+  local e = row.entry
+  local left = { indent }
+  local dir, base = e.rel:match("^(.*/)([^/]*)$")
+  if row.short then
+    left[2] = { e.rel:match("[^/]*$"), cut = true }
+  elseif dir then
+    -- The folder dimmed, the file name in the normal colour.
+    left[2], left[3] = { dir, "AgentEditsMeta", cut = true }, { base, cut = true }
+  else
+    left[2] = { e.rel, cut = true }
+  end
+  local right = { { " " } }
+  if e.reviewed then right[#right + 1] = { "✓ ", "AgentEditsReviewedMark", keep = true } end
+  if e.deleted then right[#right + 1] = { "✗ ", "Removed", keep = true } end
+  -- In the session view the header names the agent.
+  if not M.grouped then right[#right + 1] = { e.agent, agent_hl(e.agent) } end
+  right[#right + 1] = { e.via == "shell" and "$" or " ", "AgentEditsMeta" }
+  right[#right + 1] = { string.format(" %3s", ago(e.ts)), "AgentEditsMeta" }
+  local line_hl = e.deleted and "AgentEditsDeleted" or (e.reviewed and "Comment" or nil)
+  return left, right, line_hl
 end
 
 local function render()
-  local lines, headers, dimmed, deleted = {}, {}, {}, {}
+  local lines, spans, line_hls = {}, {}, {}
+  local width = vim.api.nvim_win_get_width(M.list_win) - 1
   if #M.rows == 0 and #filter_labels() > 0 then
     lines = { "", "  No files match the filters:", "  " .. table.concat(filter_labels(), " "),
       "", "  F clears them." }
@@ -402,41 +553,27 @@ local function render()
     lines = { "", "  No files edited by agents yet." }
   else
     for i, row in ipairs(M.rows) do
-      if row.group then
-        local g = row.group
-        local where = g.project ~= "" and vim.fn.fnamemodify(g.project, ":~") or "?"
-        local mark = M.folded[g.key] and "▸" or "▾"
-        lines[i] = fit(string.format(" %s %s %s", mark, g.agent, where),
-          string.format(" %d %s", #g.files, ago(g.ts)), LIST_WIDTH - 1)
-        headers[#headers + 1] = i
-      elseif M.grouped then
-        local e = row.entry
-        lines[i] = fit("   " .. e.rel, (e.reviewed and " ✓ " or " ") .. (e.deleted and "✗ " or "")
-          .. (e.via == "shell" and "$ " or "") .. ago(e.ts), LIST_WIDTH - 1)
-      else
-        local e = row.entry
-        lines[i] = fit(" " .. e.rel, string.format(" %s%s%s%s %s", e.reviewed and "✓ " or "",
-          e.deleted and "✗ " or "", e.agent, e.via == "shell" and "$" or "", ago(e.ts)), LIST_WIDTH - 1)
+      local left, right, line_hl = row_chunks(row)
+      local row_spans
+      lines[i], row_spans = compose(left, right, width)
+      -- A dimmed or struck-through line keeps only its marks coloured.
+      local plain = line_hl == "Comment" or line_hl == "AgentEditsDeleted"
+      for _, s in ipairs(row_spans) do
+        if s[4] or not plain then spans[#spans + 1] = { i, s[1], s[2], s[3] } end
       end
-      if row.entry and row.entry.reviewed then dimmed[#dimmed + 1] = i end
-      if row.entry and row.entry.deleted then deleted[#deleted + 1] = i end
+      if line_hl then line_hls[#line_hls + 1] = { i, line_hl } end
     end
   end
   vim.bo[M.list_buf].modifiable = true
   vim.api.nvim_buf_set_lines(M.list_buf, 0, -1, false, lines)
   vim.bo[M.list_buf].modifiable = false
   vim.api.nvim_buf_clear_namespace(M.list_buf, list_ns, 0, -1)
-  for _, i in ipairs(headers) do
-    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
-      { line_hl_group = "Title", priority = 10 })
+  for _, l in ipairs(line_hls) do
+    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, l[1] - 1, 0,
+      { line_hl_group = l[2], priority = l[2] == "AgentEditsDeleted" and 11 or 10 })
   end
-  for _, i in ipairs(dimmed) do
-    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
-      { line_hl_group = "Comment", priority = 10 })
-  end
-  for _, i in ipairs(deleted) do
-    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, i - 1, 0,
-      { line_hl_group = "AgentEditsDeleted", priority = 11 })
+  for _, s in ipairs(spans) do
+    vim.api.nvim_buf_set_extmark(M.list_buf, list_ns, s[1] - 1, s[2], { end_col = s[3], hl_group = s[4], priority = 20 })
   end
   local count = #M.entries == M.total and tostring(M.total) or (#M.entries .. "/" .. M.total)
   local to_review = 0
@@ -515,6 +652,13 @@ local function move(delta)
     for i = from, to, step do
       if rows[i].entry then target = i break end
     end
+  elseif delta == 0 then
+    -- Stay, or go to the nearest file row below (else above) a header.
+    for _, step in ipairs({ 1, -1 }) do
+      local i = cur
+      while rows[i] and not rows[i].entry do i = i + step end
+      if rows[i] then target = i break end
+    end
   else
     local step, i = delta > 0 and 1 or -1, cur
     for _ = 1, math.abs(delta) do
@@ -536,28 +680,97 @@ local function toggle_grouped()
   refresh(true)
 end
 
--- Enter on a header folds or unfolds its group, Enter on a file jumps into
--- the code. za folds / unfolds the group of the header or file under the cursor.
-local function list_enter(fold_only)
-  local cur = vim.api.nvim_win_get_cursor(M.list_win)[1]
-  local row = M.rows[cur]
-  if row and row.entry and fold_only and M.grouped then
-    for i = cur, 1, -1 do
-      if M.rows[i].group then row = M.rows[i] break end
+local function toggle_folders()
+  M.folders = not M.folders
+  refresh(true)
+end
+
+local function header_key(row)
+  local h = row and (row.group or row.folder)
+  return h and h.key
+end
+
+-- The files a row stands for: its file, or every file in its folder or session.
+local function row_files(row)
+  if not row then return {} end
+  if row.entry then return { row.entry } end
+  return (row.group or row.folder).files
+end
+
+local function cursor_row() return vim.api.nvim_win_get_cursor(M.list_win)[1] end
+
+-- The header that holds row `i`: the nearest one above, one level up.
+local function parent_row(i)
+  local depth = M.rows[i] and M.rows[i].depth or 0
+  for j = i - 1, 1, -1 do
+    if M.rows[j].depth < depth and header_key(M.rows[j]) then return j end
+  end
+end
+
+-- Row `i` when it is a header, else the header that holds it.
+local function own_header(i)
+  if header_key(M.rows[i]) then return i end
+  return parent_row(i)
+end
+
+-- Folds (true), unfolds (false) or toggles (nil) the header on row `i`, and
+-- leaves the cursor on it.
+local function set_fold(i, folded)
+  local key = i and header_key(M.rows[i])
+  if not key then return end
+  if folded == nil then folded = not is_folded(key) end
+  if is_folded(key) == folded then
+    vim.api.nvim_win_set_cursor(M.list_win, { i, 0 })
+    return
+  end
+  M.folded[key] = folded
+  refresh(true)
+  for j, r in ipairs(M.rows) do
+    if header_key(r) == key then
+      vim.api.nvim_win_set_cursor(M.list_win, { j, 0 })
+      break
     end
   end
-  if row and row.group then
-    local key = row.group.key
-    M.folded[key] = not M.folded[key]
-    refresh(true)
-    for i, r in ipairs(M.rows) do
-      if r.group and r.group.key == key then
-        vim.api.nvim_win_set_cursor(M.list_win, { i, 0 })
-        break
-      end
-    end
-  elseif row and not fold_only then
+end
+
+-- zM folds every folder and session, zR unfolds them all.
+local function fold_all(folded)
+  M.folded, M.fold_default = {}, folded
+  refresh(true)
+  if folded and #M.rows > 0 then vim.api.nvim_win_set_cursor(M.list_win, { 1, 0 }) end
+end
+
+-- Enter: folds / unfolds a header, jumps into the code from a file.
+local function list_enter()
+  local i = cursor_row()
+  if header_key(M.rows[i]) then
+    set_fold(i)
+  elseif M.rows[i] then
     vim.api.nvim_set_current_win(M.code_win)
+  end
+end
+
+-- l: opens a folded header, goes into an open one, jumps into the code from a file.
+local function list_right()
+  local i = cursor_row()
+  local key = header_key(M.rows[i])
+  if not key then
+    if M.rows[i] then vim.api.nvim_set_current_win(M.code_win) end
+  elseif is_folded(key) then
+    set_fold(i, false)
+  elseif M.rows[i + 1] and M.rows[i + 1].depth > M.rows[i].depth then
+    vim.api.nvim_win_set_cursor(M.list_win, { i + 1, 0 })
+  end
+end
+
+-- h: folds an open header, else folds the one that holds the row.
+local function list_left()
+  local i = cursor_row()
+  local key = header_key(M.rows[i])
+  if key and not is_folded(key) then
+    set_fold(i, true)
+  else
+    set_fold(parent_row(i), true)
   end
 end
 
@@ -902,14 +1115,15 @@ end
 local function revert_files(first, last)
   local todo, skipped, seen = {}, {}, {}
   for row = first, last do
-    local r = M.rows[row]
-    if r and r.entry and not seen[r.entry.path] then
-      seen[r.entry.path] = true
-      local base, why = revert_base(r.entry)
-      if base then
-        todo[#todo + 1] = { e = r.entry, base = base }
-      else
-        skipped[#skipped + 1] = why
+    for _, e in ipairs(row_files(M.rows[row])) do
+      if not seen[e.path] then
+        seen[e.path] = true
+        local base, why = revert_base(e)
+        if base then
+          todo[#todo + 1] = { e = e, base = base }
+        else
+          skipped[#skipped + 1] = why
+        end
       end
     end
   end
@@ -1107,12 +1321,17 @@ local function send_selection(hide, ask_comment)
 end
 
 -- Paste "@path " references to the selected files (list rows) into the
--- agent's prompt. Claude Code and Codex read them as file references.
+-- agent's prompt. Claude Code and Codex read them as file references. A
+-- folder row sends the folder, a session row its files.
 local function send_references(first, last)
   local target, refs = agent_target(), {}
   for row = first, last do
     local r = M.rows[row]
-    if r and r.entry then refs[#refs + 1] = "@" .. agent_path(r.entry.path, target, true) end
+    if r and r.folder and r.folder.path ~= "" then
+      refs[#refs + 1] = "@" .. agent_path(r.folder.path, target, true) .. "/"
+    else
+      for _, e in ipairs(row_files(r)) do refs[#refs + 1] = "@" .. agent_path(e.path, target, true) end
+    end
   end
   if #refs == 0 then return end
   local text = table.concat(refs, " ") .. " "
@@ -1214,12 +1433,15 @@ end
 -- time of the latest edit, so a newer edit brings the file back.
 local function toggle_reviewed(first, last)
   local paths, unmark = {}, nil
+  local header = first == last and header_key(M.rows[first])
   for row = first, last do
-    local r = M.rows[row]
-    if r and r.entry and not vim.tbl_contains(paths, r.entry.path) then
-      paths[#paths + 1] = r.entry.path
-      -- The first file decides: reviewed ones get unmarked, others marked.
-      if unmark == nil then unmark = r.entry.reviewed end
+    for _, e in ipairs(row_files(M.rows[row])) do
+      if not vim.tbl_contains(paths, e.path) then
+        paths[#paths + 1] = e.path
+        -- The first file decides: reviewed ones get unmarked, others marked.
+        -- In a folder the files to review come first.
+        if unmark == nil then unmark = e.reviewed end
+      end
     end
   end
   if #paths == 0 then return end
@@ -1232,7 +1454,12 @@ local function toggle_reviewed(first, last)
   vim.fn.system(vim.list_extend({ log_cmd, "--reviewed", tostring(ts) }, paths))
   local keep = selected()
   refresh(true)
-  if unmark then
+  if header then
+    -- Stay on the folder or session, wherever it moved.
+    for i, r in ipairs(M.rows) do
+      if header_key(r) == header then vim.api.nvim_win_set_cursor(M.list_win, { i, 0 }) break end
+    end
+  elseif unmark then
     if keep then select_path(keep.path, keep.session) end
   else
     -- Inbox style: the reviewed files sink, so stay on the same row, which
@@ -1325,16 +1552,19 @@ local HELP = {
   " agent-edits  ·  :AgentEditsHelp or g?",
   "",
   " File list",
-  "   j / k, gg / G     select a file (the preview follows)",
-  "   Enter / l         jump into the code",
+  "   j / k, gg / G     move (the preview follows the file)",
+  "   Enter             jump into the code; on a folder, fold / unfold it",
+  "   l / h             open / close a folder (l on a file: into the code)",
+  "   za  zo  zc        toggle / open / close the folder under the cursor",
+  "   zR / zM           open / close every folder (all start closed)",
+  "   f                 folder tree (toggle, on by default)",
   "   t                 group by agent session (toggle)",
-  "   za                fold / unfold the session group",
   "   r                 reload the list now",
   "   a                 filter by agent: all, Claude, Codex, Grok",
   "   s                 only the session of the selected file (toggle)",
   "   p                 only this project (toggle)",
-  "   x                 mark / unmark as reviewed (also on a visual",
-  "                     selection); a new edit brings the file back",
+  "   x                 mark / unmark as reviewed (also on a folder or a",
+  "                     visual selection); a new edit brings the file back",
   "   X                 hide reviewed files (toggle)",
   "   H                 hide files with nothing left to commit (toggle)",
   "   F                 clear the filters",
@@ -1400,10 +1630,22 @@ local function show_help()
   end
 end
 
--- Deleted files in the list: struck through, in the colour of removed lines.
+-- The list's colours, linked to standard groups so they follow the
+-- colorscheme. Deleted files: struck through, in the colour of removed lines.
 local function set_highlights()
   local removed = vim.api.nvim_get_hl(0, { name = "Removed", link = false })
   vim.api.nvim_set_hl(0, "AgentEditsDeleted", { fg = removed.fg, ctermfg = removed.ctermfg, strikethrough = true })
+  local links = {
+    AgentEditsClaude = "DiagnosticWarn", AgentEditsCodex = "DiagnosticInfo", AgentEditsGrok = "DiagnosticHint",
+    AgentEditsAgent = "Special", AgentEditsFolder = "Directory", AgentEditsFoldMark = "NonText",
+    AgentEditsMeta = "Comment", AgentEditsReviewedMark = "DiagnosticOk",
+  }
+  for name, to in pairs(links) do vim.api.nvim_set_hl(0, name, { link = to, default = true }) end
+end
+
+-- 30% of the screen, between 40 and 60 columns.
+local function list_width()
+  return math.min(60, math.max(40, math.floor(vim.o.columns * 0.3)))
 end
 
 local function setup()
@@ -1413,7 +1655,7 @@ local function setup()
   vim.cmd("topleft vnew")
   M.list_win = vim.api.nvim_get_current_win()
   M.list_buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_win_set_width(M.list_win, LIST_WIDTH)
+  vim.api.nvim_win_set_width(M.list_win, list_width())
   local bo, wo = vim.bo[M.list_buf], vim.wo[M.list_win]
   bo.buftype, bo.bufhidden, bo.swapfile, bo.filetype = "nofile", "hide", false, "agent-edits"
   wo.number, wo.relativenumber, wo.cursorline, wo.wrap, wo.winfixwidth = false, false, true, false, true
@@ -1422,16 +1664,21 @@ local function setup()
     vim.keymap.set("n", lhs, rhs, vim.tbl_extend("force", { silent = true, nowait = true }, opts or {}))
   end
   local lb = { buffer = M.list_buf }
-  map("j", function() move(1) end, lb)
-  map("k", function() move(-1) end, lb)
-  map("<Down>", function() move(1) end, lb)
-  map("<Up>", function() move(-1) end, lb)
-  map("gg", function() move(-math.huge) end, lb)
-  map("G", function() move(math.huge) end, lb)
-  map("<CR>", function() list_enter(false) end, lb)
-  map("za", function() list_enter(true) end, lb)
+  -- j / k / gg / G are the plain motions: they stop on folders too.
+  map("<CR>", list_enter, lb)
+  map("l", list_right, lb)
+  map("h", list_left, lb)
+  map("za", function() set_fold(own_header(cursor_row())) end, lb)
+  map("zo", function() set_fold(own_header(cursor_row()), false) end, lb)
+  map("zc", function()
+    local i = cursor_row()
+    local key = header_key(M.rows[i])
+    set_fold((key and not is_folded(key)) and i or parent_row(i), true)
+  end, lb)
+  map("zM", function() fold_all(true) end, lb)
+  map("zR", function() fold_all(false) end, lb)
   map("t", toggle_grouped, lb)
-  map("l", function() vim.api.nvim_set_current_win(M.code_win) end, lb)
+  map("f", toggle_folders, lb)
   map("r", function() refresh(true) end, lb)
   map("a", cycle_agent, lb)
   map("s", toggle_session, lb)
@@ -1524,6 +1771,15 @@ local function setup()
         end)
       elseif win == M.list_win or win == M.code_win then
         vim.schedule(function() vim.cmd("qa!") end)
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("VimResized", {
+    callback = function()
+      if vim.api.nvim_win_is_valid(M.list_win) then
+        vim.api.nvim_win_set_width(M.list_win, list_width())
+        refresh(true)
       end
     end,
   })
