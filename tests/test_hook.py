@@ -18,11 +18,18 @@ class EditToolTests(StateTest):
         self.edit("claude-edit", path, lambda: self.write("a.txt", "two\n"))
         rows = self.log()
         self.assertEqual(len(rows), 1)
-        ts, agent, logged, project, session, via = rows[0]
+        ts, agent, logged, project, session, via, pane = rows[0]
         self.assertAlmostEqual(int(ts), time.time(), delta=60)
-        self.assertEqual((agent, logged, project, session, via),
-                         ("Claude", path, self.work, "claude-session-1", "tool"))
+        self.assertEqual((agent, logged, project, session, via, pane),
+                         ("Claude", path, self.work, "claude-session-1", "tool", "-"))
         self.assertEqual(self.read(self.baseline("claude-session-1", path)), "one\n")
+
+    def test_tmux_pane_of_the_agent(self):
+        path = self.write("a.txt", "one\n")
+        self.edit("claude-edit", path, lambda: self.write("a.txt", "two\n"))
+        tmux = {"TMUX": "/tmp/tmux-1000/default,4242,0", "TMUX_PANE": "%7"}
+        self.hook(event("claude-edit", "PostToolUse", file=path, cwd=self.work), env=tmux)
+        self.assertEqual([row[6] for row in self.log()], ["-", "4242:%7"])
 
     def test_baseline_is_taken_before_the_first_edit_only(self):
         path = self.write("a.txt", "one\n")

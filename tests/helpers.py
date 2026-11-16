@@ -57,7 +57,7 @@ class StateTest(unittest.TestCase):
                      "[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n")
         self.env = dict(os.environ, XDG_STATE_HOME=os.path.join(self.tmp, "state"),
                         GIT_CONFIG_GLOBAL=gitconfig, GIT_CONFIG_NOSYSTEM="1")
-        for name in ("CLAUDE_PROJECT_DIR", "AGENT_EDITS_DEBUG", "GIT_DIR", "GIT_WORK_TREE"):
+        for name in ("CLAUDE_PROJECT_DIR", "AGENT_EDITS_DEBUG", "GIT_DIR", "GIT_WORK_TREE", "TMUX", "TMUX_PANE"):
             self.env.pop(name, None)
 
     # Running the hook -------------------------------------------------------

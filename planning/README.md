@@ -43,6 +43,7 @@ viewer. Every column is appended at the end, so old lines stay readable:
 | 4 | v1 | Directory the agent session was started in |
 | 5 | task 1 | Agent session id (`-` when unknown) |
 | 6 | task 10 | How the edit was detected: `tool` (an edit tool) or `shell` (a shell command) |
+| 7 | tab scope | tmux pane of the agent: `<server pid>:<pane id>` (`-` outside tmux) |
 
 Other state lives next to the log: `baselines/` (task 1), `reviewed.tsv` (task 8),
 `pending/` (task 10), and later `reverted/` (task 14), `review.json` (task 17) and
