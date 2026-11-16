@@ -83,14 +83,16 @@ end
 -- hook pruned it, or :AgentEditsClear), it is parsed again from the start.
 -- latest: the latest edit of each path (flat list); per_session: the latest
 -- edit of each path per session (grouped list, where a file edited by two
--- sessions belongs to both).
-local log_cache = { offset = 0, head = "", latest = {}, per_session = {} }
+-- sessions belongs to both); per_pane: the latest edit of each path per tmux
+-- pane (the list of one tmux window).
+local function empty_log() return { offset = 0, head = "", latest = {}, per_session = {}, per_pane = {} } end
+local log_cache = empty_log()
 
 local function read_log()
   local c = log_cache
   local st = vim.uv.fs_stat(log_file)
   if not st then
-    log_cache = { offset = 0, head = "", latest = {}, per_session = {} }
+    log_cache = empty_log()
     return log_cache
   end
   if st.size == c.offset and c.mtime and st.mtime.sec == c.mtime.sec and st.mtime.nsec == c.mtime.nsec then
@@ -100,7 +102,7 @@ local function read_log()
   if not fh then return c end
   local head = fh:read(64) or ""
   if st.size < c.offset or head:sub(1, #c.head) ~= c.head then
-    c = { offset = 0, head = "", latest = {}, per_session = {} }
+    c = empty_log()
     log_cache = c
   end
   fh:seek("set", c.offset)
@@ -117,12 +119,14 @@ local function read_log()
     if ts and path and path ~= "" then
       local e = {
         ts = ts, agent = f[2], path = path,
-        project = f[4] or "", session = f[5] or "-", via = f[6] or "tool",
+        project = f[4] or "", session = f[5] or "-", via = f[6] or "tool", pane = f[7] or "-",
       }
       e.rel, e.base = display_name(path, f[4])
       if not c.latest[path] or c.latest[path].ts <= ts then c.latest[path] = e end
       local key = e.session .. "\0" .. path
       if not c.per_session[key] or c.per_session[key].ts <= ts then c.per_session[key] = e end
+      key = e.pane .. "\0" .. path
+      if e.pane ~= "-" and (not c.per_pane[key] or c.per_pane[key].ts <= ts) then c.per_pane[key] = e end
     end
   end
   return c
@@ -145,8 +149,20 @@ local function read_entries()
   marks, M.reviewed_raw = read_reviewed()
   local log = read_log()
   local latest = log.latest
+  local shown, sessions = latest, log.per_session
+  -- One tmux window: only the edits made from its panes.
+  local panes = M.tab_only and M.tab and M.tab.panes
+  if panes then
+    shown, sessions = {}, {}
+    for _, e in pairs(log.per_pane) do
+      if panes[e.pane] and (not shown[e.path] or shown[e.path].ts < e.ts) then shown[e.path] = e end
+    end
+    for key, e in pairs(log.per_session) do
+      if panes[e.pane] then sessions[key] = e end
+    end
+  end
   -- Reviewed until anyone edits the file again.
-  for _, t in ipairs({ latest, log.per_session }) do
+  for _, t in ipairs({ shown, sessions }) do
     for _, e in pairs(t) do
       local mark = marks[e.path]
       e.reviewed = mark ~= nil and latest[e.path] ~= nil and mark >= latest[e.path].ts
@@ -166,7 +182,7 @@ local function read_entries()
     end
     return sort_entries(out)
   end
-  return listed(latest), listed(log.per_session)
+  return listed(shown), listed(sessions)
 end
 
 -- Filters ------------------------------------------------------------------
@@ -288,6 +304,7 @@ end
 
 local function filter_labels()
   local f, out = M.filters, {}
+  if M.tab_only and M.tab then out[#out + 1] = M.tab.label end
   if f.agent then out[#out + 1] = f.agent end
   if f.session then out[#out + 1] = "sess:" .. f.session:sub(1, 6) end
   if f.project then out[#out + 1] = "project" end
@@ -546,9 +563,13 @@ end
 local function render()
   local lines, spans, line_hls = {}, {}, {}
   local width = vim.api.nvim_win_get_width(M.list_win) - 1
-  if #M.rows == 0 and #filter_labels() > 0 then
+  local only_tab = M.tab_only and M.tab and #filter_labels() == 1
+  if #M.rows == 0 and only_tab then
+    lines = { "", "  No files edited by the agents", "  in this tmux window yet.", "",
+      "  w shows every window." }
+  elseif #M.rows == 0 and #filter_labels() > 0 then
     lines = { "", "  No files match the filters:", "  " .. table.concat(filter_labels(), " "),
-      "", "  F clears them." }
+      "", "  F clears them, w shows every window." }
   elseif #M.rows == 0 then
     lines = { "", "  No files edited by agents yet." }
   else
@@ -590,6 +611,42 @@ local function render()
     labels ~= "" and labels or vim.fn.fnamemodify(root, ":t"))
 end
 
+-- One tmux window -----------------------------------------------------------------
+-- The list shows only what the agents in the popup's tmux window (its "tab")
+-- edited: the hook logs the pane each agent runs in. w shows every window.
+
+M.tab_only = true
+
+local function inner_option(name)
+  local out = vim.fn.system({ "tmux", "show-options", "-qv", name })
+  return vim.v.shell_error == 0 and vim.trim(out) or ""
+end
+
+-- The popup's tmux window: { panes = set of "<server pid>:<pane id>",
+-- label }, nil outside the popup, or { gone = true } once the window is
+-- closed. Tests replace it.
+function M.current_tab()
+  if vim.env.AGENT_EDITS_POPUP ~= "1" or not vim.env.TMUX then return nil end
+  local socket = inner_option("@ae_socket")
+  local window = inner_option("@ae_window")
+  if window == "" then window = inner_option("@ae_pane") end
+  if socket == "" or window == "" then return nil end
+  local out = vim.fn.systemlist({ "tmux", "-S", socket, "list-panes", "-t", window,
+    "-F", "#{pid} #{pane_id} #{window_index} #{window_name}" })
+  if vim.v.shell_error ~= 0 then return { gone = true } end
+  local tab = { panes = {} }
+  for _, l in ipairs(out) do
+    local pid, pane, index, name = l:match("^(%d+) (%%%d+) (%d+) ?(.*)$")
+    if pid then
+      tab.panes[pid .. ":" .. pane] = true
+      -- Agents set long window titles: keep the start.
+      if vim.fn.strchars(name) > 16 then name = vim.fn.strcharpart(name, 0, 15) .. "…" end
+      tab.label = tab.label or ("window " .. index .. (name ~= "" and (" " .. name) or ""))
+    end
+  end
+  return tab.label and tab or nil
+end
+
 -- Put the cursor on the row of `path` (preferring `session`), else on the
 -- first file row, and preview it.
 local function select_path(path, session)
@@ -612,6 +669,12 @@ local function select_path(path, session)
 end
 
 local function refresh(force)
+  M.tab = M.current_tab()
+  if M.tab and M.tab.gone then
+    -- The viewer's tmux window was closed: nothing left to show.
+    vim.cmd("qa!")
+    return
+  end
   local all, per_session = read_entries()
   local git_sig = ""
   if M.hide_committed then
@@ -620,7 +683,7 @@ local function refresh(force)
   end
   local entries = apply_filters(all)
   M.total, M.all = #all, all
-  local sig = { git_sig, M.reviewed_raw }
+  local sig = { git_sig, M.reviewed_raw, M.tab_only and M.tab and M.tab.label or "" }
   for _, e in ipairs(per_session) do
     sig[#sig + 1] = e.ts .. e.session .. e.path .. (e.deleted and "\tdeleted" or "")
   end
@@ -638,6 +701,15 @@ local function refresh(force)
   else
     select_path(M.current)
   end
+end
+
+local function toggle_tab()
+  if not M.tab then
+    vim.notify("agent-edits: not opened from a tmux window")
+    return
+  end
+  M.tab_only = not M.tab_only
+  refresh(true)
 end
 
 -- Move the selection `delta` file rows (headers are skipped); math.huge and
@@ -1217,11 +1289,6 @@ local function undo_revert(force)
   vim.notify(string.format("agent-edits: undid the revert of %d file%s", #rows, #rows == 1 and "" or "s"))
 end
 
-local function inner_option(name)
-  local out = vim.fn.system({ "tmux", "show-options", "-qv", name })
-  return vim.v.shell_error == 0 and vim.trim(out) or ""
-end
-
 local function hide_popup()
   if vim.env.AGENT_EDITS_POPUP == "1" and vim.env.TMUX then
     vim.fn.jobstart({ "tmux", "detach-client" })
@@ -1559,6 +1626,7 @@ local HELP = {
   "   zR / zM           open / close every folder (all start closed)",
   "   f                 folder tree (toggle, on by default)",
   "   t                 group by agent session (toggle)",
+  "   w                 only this tmux window's agents / every window",
   "   r                 reload the list now",
   "   a                 filter by agent: all, Claude, Codex, Grok",
   "   s                 only the session of the selected file (toggle)",
@@ -1678,6 +1746,7 @@ local function setup()
   map("zM", function() fold_all(true) end, lb)
   map("zR", function() fold_all(false) end, lb)
   map("t", toggle_grouped, lb)
+  map("w", toggle_tab, lb)
   map("f", toggle_folders, lb)
   map("r", function() refresh(true) end, lb)
   map("a", cycle_agent, lb)

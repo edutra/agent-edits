@@ -38,9 +38,10 @@ end
 local function refresh() keys("r") end
 
 -- One log line: { age in seconds, agent, path (relative to root or absolute),
--- session = "s1", via = "tool", project = root }.
+-- session = "s1", via = "tool", project = root, pane = "-" }.
 local function line(r)
-  return table.concat({ NOW - r[1], r[2], abs(r[3]), r.project or root, r.session or "s1", r.via or "tool" }, "\t") .. "\n"
+  return table.concat({ NOW - r[1], r[2], abs(r[3]), r.project or root, r.session or "s1", r.via or "tool",
+    r.pane or "-" }, "\t") .. "\n"
 end
 
 -- Replace the log. It is emptied and read first, so the viewer parses the new
@@ -158,6 +159,8 @@ local function reset()
   -- Unfolded, so the rows show; "everything starts folded" has its own test.
   V().grouped, V().folders, V().folded, V().fold_default = false, true, {}, false
   V().confirm = function() return true end
+  -- Outside tmux: every window.
+  V().current_tab, V().tab_only = function() return nil end, true
   vim.fn.delete(state .. "/baselines", "rf")
   vim.fn.delete(state .. "/reverted", "rf")
   write(state .. "/reviewed.tsv", "")
@@ -451,6 +454,53 @@ test("H hides files with nothing left to commit", function()
   -- git status runs in the background.
   assert(vim.wait(10000, function() return #names() == 2 end), "git status never finished")
   eq(names(), { "repo/dirty.txt", "repo/new.txt" }, "rows")
+end)
+
+-- One tmux window ------------------------------------------------------------------
+
+-- The viewer as if opened from a tmux window holding `panes`.
+local function in_window(panes, label)
+  local set = {}
+  for _, p in ipairs(panes) do set[p] = true end
+  V().current_tab = function() return { panes = set, label = label or "window 1" } end
+  refresh()
+end
+
+test("only the files the agents of this tmux window edited", function()
+  file("mine.txt") file("theirs.txt") file("both.txt") file("old.txt")
+  log({ { 10, "Claude", "mine.txt", pane = "100:%1" }, { 20, "Codex", "theirs.txt", pane = "100:%2" },
+    { 30, "Claude", "both.txt", pane = "100:%1" }, { 5, "Codex", "both.txt", pane = "100:%2" },
+    { 40, "Claude", "old.txt" } })
+  eq(#names(), 4, "outside tmux")
+  in_window({ "100:%1", "100:%3" }, "window 2 code")
+  eq(names(), { "mine.txt", "both.txt" }, "this window")
+  -- both.txt from this window's edit, not the newer one made elsewhere.
+  eq(entries()[2].agent, "Claude", "edit of this window")
+  has(vim.wo[V().list_win].winbar, "window 2 code", "winbar")
+  keys("w")
+  eq(#names(), 4, "w shows every window")
+  keys("w")
+  eq(#names(), 2, "w again")
+end)
+
+test("another tmux server, another pane", function()
+  file("a.txt")
+  log({ { 10, "Claude", "a.txt", pane = "999:%1" } })
+  in_window({ "100:%1" })
+  eq(names(), {}, "rows")
+  has(table.concat(lines(), "\n"), "in this tmux window yet", "empty message")
+end)
+
+test("a closed tmux window ends the viewer", function()
+  local quit
+  local cmd = vim.cmd
+  vim.cmd = function(c) if c == "qa!" then quit = true else cmd(c) end end
+  V().current_tab = function() return { gone = true } end
+  local ok, err = pcall(refresh)
+  vim.cmd = cmd
+  V().current_tab = function() return nil end
+  assert(ok, err)
+  eq(quit, true, "quit")
 end)
 
 -- Revert ------------------------------------------------------------------------
