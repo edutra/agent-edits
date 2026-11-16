@@ -37,3 +37,20 @@ work outside git too, where `git diff` can't help.
 - A session that edits, creates and deletes a file in a git repository: the patch applies
   with `git apply` on a clean checkout of the starting point and gives the current tree.
 - The same outside git, with `patch -p1`.
+
+## Implementation notes
+
+- Paths are relative to the git work tree of `--root` (or of the session's project), or to that
+  directory outside git: `git apply` takes paths from the top of the work tree.
+- `--root` keeps the files the viewer's `p` keeps (`in_project`, the same rule), so a session
+  started in the project also brings its files outside it, with `a/` + their absolute path and
+  a `# ... apply from /` comment.
+- Binary files and `.skip` baselines are a `#` comment instead of `Binary files differ`: git
+  refuses a binary patch without its full index line, and the rest of the patch must apply.
+- Created or deleted empty files can't be expressed as a plain unified diff: also a comment.
+- Lines end only at `\n` (not `str.splitlines`, which also splits on `\r`, `\f`...), and a
+  missing final newline gets `\ No newline at end of file`.
+- `:AgentEditsPatch!` writes `patches/<session>.patch` in the state folder and pastes its
+  absolute path, since it is outside the agent's directory.
+- Tests: `tests/test_patch.py` (applies with `git apply` on a clone of the starting point and
+  with `patch -p1` outside git, then compares the trees) and three viewer tests.

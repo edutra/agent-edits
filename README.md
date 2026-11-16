@@ -128,6 +128,7 @@ is already running in the background, the same key brings it back as you left it
 | `c` | visual selection | Ask for a comment, then paste the code followed by the comment. The viewer stays open, so you can queue several comments before you switch to the agent. `Esc` or an empty comment sends nothing. |
 | `:AgentEditsHelp` / `g?` | anywhere | Show these key bindings |
 | `:AgentEditsUndoRevert` | command | Put back what the last `R` replaced. It refuses when a file changed since the revert (the agent may have edited it again); `:AgentEditsUndoRevert!` puts it back anyway. Reverts are kept for 7 days. |
+| `:AgentEditsPatch` | command | Everything the selected file's session changed, as one unified diff, in a new tab (`q` closes it). `:AgentEditsPatch FILE` writes it to `FILE`; `:AgentEditsPatch!` pastes an `@` reference to it into the agent's prompt, for a "review this change" request. Only this project's files while `p` is on. From a shell: `agent-edits-log --patch SESSION [--root DIR]`. |
 | `:AgentEditsClear` | command | Forget this project's edits, after asking for confirmation. This uses the same project rule as `p`. `:AgentEditsClear!` forgets every edit. Snapshots that are no longer used are deleted. |
 
 All other Vim motions work in the code window: search, marks, `%`, `Ctrl-d`/`Ctrl-u`,
@@ -163,6 +164,11 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
 - A file that no longer exists stays in the list, struck through and marked `✗`, when there is a
   snapshot of what it held: `D` shows it. Files an agent created and then removed again
   (scratch files) are hidden.
+- `:AgentEditsPatch` diffs each file against its snapshot. Paths are relative to the git work
+  tree (or the session's directory), so `git apply` and `patch -p1` take it. Files without a
+  snapshot are diffed against `HEAD` inside git; binary files, files over 2 MB and shell edits
+  outside git are listed as `#` comments, not diffed. Two sessions that edited the same file
+  give overlapping patches, each from its own starting point.
 - Log entries older than 14 days are pruned once the log grows past about 1 MB. Snapshots are
   kept as long as their session is still in the log.
   `:AgentEditsClear` clears the history at any time.
@@ -206,6 +212,7 @@ agent-edits/
 │   ├── run.sh              # runs every test
 │   ├── test_hook.py        # the hook, fed with the events in fixtures/
 │   ├── test_install.py     # install.sh and uninstall.sh against a temporary HOME
+│   ├── test_patch.py       # agent-edits-log --patch applies with git apply and patch -p1
 │   ├── test_popup.py       # the popup starts a viewer once and re-attaches to it
 │   ├── test_viewer.py      # runs viewer/run.lua in a headless Neovim
 │   └── fixtures/           # one hook event per agent and tool

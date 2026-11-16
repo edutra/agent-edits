@@ -1276,6 +1276,51 @@ local function clear_history(all)
   vim.notify(string.format("agent-edits: cleared %d entries", count))
 end
 
+-- :AgentEditsPatch: everything the selected file's session changed, as a
+-- unified diff (agent-edits-log --patch), in a new tab. With a file name, it
+-- is written there instead; with !, saved under the state folder and pasted
+-- into the agent's prompt as an @reference. Only this project's files while
+-- p is on.
+local function session_patch(opts)
+  local e = selected() or M.current
+  if not e or e.session == "-" then
+    warn("select a file edited in an agent session")
+    return
+  end
+  local args = { log_cmd, "--patch", e.session }
+  if M.filters.project then vim.list_extend(args, { "--root", root }) end
+  local out = vim.system(args):wait()
+  local text = out.stdout or ""
+  if out.code ~= 0 or text == "" then
+    warn(out.code ~= 0 and "could not build the patch" or "the session left nothing changed")
+    return
+  end
+  local short = e.session:sub(1, 8)
+  if opts.bang or opts.args ~= "" then
+    local file = opts.args ~= "" and vim.fn.fnamemodify(vim.fn.expand(opts.args), ":p")
+      or (state_dir .. "/patches/" .. e.session .. ".patch")
+    if not write_raw(file, text) then
+      warn("could not write " .. file)
+      return
+    end
+    if opts.bang then
+      local target = agent_target()
+      send_text("@" .. agent_path(file, target, true) .. " ", false, "the patch of session " .. short, target)
+    else
+      vim.notify("agent-edits: wrote " .. vim.fn.fnamemodify(file, ":~"))
+    end
+    return
+  end
+  vim.cmd("tabnew")
+  local buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, (split_lines(text)))
+  vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].swapfile = "nofile", "wipe", false
+  vim.bo[buf].filetype = "diff"
+  vim.bo[buf].modifiable = false
+  pcall(vim.api.nvim_buf_set_name, buf, "agent-edits://patch/" .. e.session)
+  vim.keymap.set("n", "q", "<cmd>tabclose<cr>", { buffer = buf, nowait = true, silent = true })
+end
+
 local HELP = {
   " agent-edits  ·  :AgentEditsHelp or g?",
   "",
@@ -1319,6 +1364,10 @@ local HELP = {
   " Commands",
   "   :AgentEditsClear  forget this project's edits (! for all of them)",
   "   :AgentEditsUndoRevert  undo the last R (! even if the file changed since)",
+  "   :AgentEditsPatch [file]  the session of the selected file as one",
+  "                     patch, in a new tab (q closes it) or written to file;",
+  "                     ! pastes @patch into the agent's prompt. Only this",
+  "                     project's files while p is on",
   "   :AgentEditsHelp   this help",
   "",
   " Claude$ (a $ after the agent): the edit was inferred from a shell",
@@ -1415,6 +1464,10 @@ local function setup()
   map("R", revert_here)
   vim.keymap.set("x", "R", function() revert_files(visual_range()) end,
     { buffer = M.list_buf, silent = true, nowait = true })
+  vim.api.nvim_create_user_command("AgentEditsPatch", session_patch, {
+    bang = true, nargs = "?", complete = "file",
+    desc = "agent-edits: the selected file's session as a patch (file to write it, ! to send it)",
+  })
   vim.api.nvim_create_user_command("AgentEditsUndoRevert", function(o) undo_revert(o.bang) end,
     { bang = true, desc = "agent-edits: undo the last revert (! even if the files changed since)" })
   map("]c", function() jump_change(1) end)
