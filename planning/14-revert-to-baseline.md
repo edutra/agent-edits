@@ -30,12 +30,25 @@ whole file.
 
 ## Edge cases
 
-- The file changed since the markers were computed (the agent is still editing): compare
-  the file's mtime with the one used for the markers, and refuse with "the file changed,
-  try again" if it differs.
-- Binary or skipped (`.skip`) baselines: whole-file revert only.
+- Binary files (a NUL byte in either version): whole-file revert only, a line diff means
+  nothing there.
+- Files over 2 MB (`.skip` baseline): no copy was kept, so no revert at all; `R` says so.
+- An edit with no baseline (shell edits, older entries): `R` says so instead of guessing.
+- Hunk revert reads the file from disk and refuses ("the file changed, try again") when the
+  previewed buffer differs from it, so the cursor always points at the lines on disk. This
+  replaces the mtime comparison planned above.
+- The undo checks each file's size and mtime against the ones recorded right after the
+  revert. `:AgentEditsUndoRevert!` skips that check.
 - The file is open in the user's editor: their editor will notice the change (autoread or
   a warning), as with any agent edit.
+
+## Implementation notes
+
+- `reverted/<id>/` holds a copy of each file as it was before the revert and an
+  `index.tsv` (`<path>\t<copy or absent>\t<size and mtime after the revert>`). The index
+  is written last, so an interrupted revert is never undone. Folders older than 7 days are
+  removed on the next revert.
+- The confirmation goes through `M.confirm`, which the viewer tests replace.
 
 ## Verification
 

@@ -27,12 +27,18 @@ Also a maintenance command, used by the viewer:
 Both print the number of log lines removed (or that would be).
   agent-edits-log --reviewed TS PATH...     mark files reviewed up to edit time TS
                                             (TS 0 removes the mark)
+  agent-edits-log --patch SESSION [--root DIR]
+      print what SESSION changed as a unified diff (baseline -> current file),
+      only files in the project in DIR with --root. Paths are relative to the
+      git top of DIR (or DIR, or the session's project): apply with
+      git apply / patch -p1.
 
 Everything lives in $XDG_STATE_HOME/agent-edits. Works with Claude Code
 (tool_name/tool_input), Grok (toolName/toolInput, also loads Claude's hooks)
 and Codex (apply_patch patch text). It never fails the agent: any error is
 swallowed and the exit code is always 0.
 """
+import difflib
 import fcntl
 import hashlib
 import json
@@ -393,7 +399,117 @@ def set_reviewed(ts, paths):
         fh.writelines(f"{p}\t{m}\n" for p, m in sorted(marks.items()))
 
 
+def read_bytes(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def git_top(folder):
+    """The top of the git work tree holding folder, None outside git (or in
+    a folder an enclosing repository ignores)."""
+    if git_paths(folder, ["rev-parse"]) is None:
+        return None
+    try:
+        out = subprocess.run(["git", "-C", folder, "rev-parse", "--show-toplevel"],
+                             capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    top = out.stdout.decode(errors="surrogateescape").rstrip("\n")
+    return top if out.returncode == 0 and top else None
+
+
+def head_version(path):
+    """(found, bytes) of path in HEAD: found False outside git, bytes None
+    when git doesn't have the file (created since)."""
+    folder = os.path.dirname(path)
+    while folder != "/" and not os.path.isdir(folder):
+        folder = os.path.dirname(folder)
+    if git_top(folder) is None:
+        return False, None
+    try:
+        out = subprocess.run(["git", "-C", folder, "show", "HEAD:./" + os.path.relpath(path, folder)],
+                             capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return False, None
+    return True, out.stdout if out.returncode == 0 else None
+
+
+def file_diff(name, old, new):
+    """Unified diff of one file, None for no change. old/new are bytes, or
+    None for a file that doesn't exist on that side."""
+    if old == new:
+        return None
+    if b"\0" in (old or b"") or b"\0" in (new or b""):
+        return f"# {name}: binary file changed, skipped\n"
+    def lines(data):
+        # Only "\n" ends a line (str.splitlines also splits on \r, \f...).
+        return re.findall(r"[^\n]*\n|[^\n]+", (data or b"").decode("utf-8", "surrogateescape"))
+    out = []
+    for line in difflib.unified_diff(lines(old), lines(new),
+                                     "/dev/null" if old is None else "a/" + name,
+                                     "/dev/null" if new is None else "b/" + name):
+        out.append(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n")
+    if not out:
+        # Created or deleted empty file: nothing a plain diff can express.
+        return f"# {name}: empty file {'created' if old is None else 'deleted'}, skipped\n"
+    return "".join(out)
+
+
+def session_patch(session, root):
+    """Print the session's changes, file by file, sorted by path."""
+    paths, project = [], ""
+    if os.path.exists(LOG):
+        with open(LOG, encoding="utf-8", errors="surrogateescape") as fh:
+            for line in fh:
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 5 or cols[4] != session:
+                    continue
+                project = project or cols[3]
+                if root is None or in_project(cols[2], cols[3], root):
+                    paths.append(cols[2])
+    base = os.path.normpath(root or project or "/")
+    base = (git_top(base) if os.path.isdir(base) else None) or base
+    folder = os.path.join(BASELINES, session)
+    out = []
+    for path in sorted(set(paths)):
+        if under(path, base) and path != base:
+            name = os.path.relpath(path, base)
+        else:
+            name = path.lstrip("/")
+            out.append(f"# {path}: outside {base}, apply from /\n")
+        snap = os.path.join(folder, baseline_key(path))
+        if os.path.exists(snap + ".skip"):
+            out.append(f"# {name}: over {MAX_BASELINE_BYTES // 1_000_000} MB, no snapshot, skipped\n")
+            continue
+        if os.path.exists(snap + ".new"):
+            old = None
+        elif os.path.exists(snap):
+            old = read_bytes(snap)
+        else:
+            found, old = head_version(path)
+            if not found:
+                out.append(f"# {name}: no snapshot (shell edit or older entry), skipped\n")
+                continue
+            out.append(f"# {name}: no snapshot, diff against HEAD\n")
+        new = read_bytes(path) if os.path.isfile(path) else None
+        diff = file_diff(name, old, new)
+        if diff:
+            out.append(diff)
+        elif out and out[-1].endswith("diff against HEAD\n"):
+            out.pop()
+    sys.stdout.buffer.write("".join(out).encode("utf-8", "surrogateescape"))
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--patch":
+        root = None
+        if len(sys.argv) > 4 and sys.argv[3] == "--root":
+            root = os.path.normpath(os.path.abspath(sys.argv[4]))
+        session_patch(sys.argv[2], root)
+        return
     if len(sys.argv) > 3 and sys.argv[1] == "--reviewed":
         set_reviewed(sys.argv[2], sys.argv[3:])
         return

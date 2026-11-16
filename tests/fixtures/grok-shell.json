@@ -1,0 +1,1 @@
+{"sessionId": "grok-session-1", "cwd": "@CWD@", "hookEventName": "@GROK_EVENT@", "toolName": "run_terminal_command", "toolInput": {"command": "@COMMAND@"}, "toolUseId": "@CALL@"}

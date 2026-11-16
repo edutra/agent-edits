@@ -4,7 +4,7 @@
 set -euo pipefail
 
 dir="${1:-$PWD}"
-root="$(cd "$dir" 2>/dev/null && pwd || pwd)"
+root="$(cd "$dir" 2>/dev/null && pwd)" || root="$PWD"
 
 viewer="${AGENT_EDITS_VIEWER:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-edits/viewer.lua}"
 if [[ ! -r "$viewer" ]]; then

@@ -4,17 +4,21 @@ See every file your AI coding agents edited, in a tmux popup with full Vim motio
 
 Press `prefix + e` in any tmux pane, and a floating Neovim window opens with every file that
 **Claude Code**, **Codex** or **Grok** edited, in any project. Git is not required. The newest
-edits are at the top. Moving through the list previews each file read-only, and the preview
+edits are at the top, grouped by folder. Moving through the list previews each file read-only, and the preview
 follows the agent live while it works. Select lines and press `y` or `d` to paste them into the
 agent's prompt.
 
 ```
-┌ Agent edits (3)  my-project ─────────┬ src/api/routes.ts  (Claude, 2m ago) ───────────────┐
-│ src/api/routes.ts         Claude 2m  │  1 import { Router } from "express";               │
-│ README.md                  Codex 9m  │  2 import { auth } from "./auth";                  │
-│ tests/routes.test.ts        Grok 1h  │  3                                                 │
-│                                      │  4 export const router = Router();                 │
-└──────────────────────────────────────┴────────────────────────────────────────────────────┘
+┌ Edits (5)  my-project ─────────────────┬ src/api/routes.ts  (Claude, 2m ago) ───────────────┐
+│ ▾ src/                               3 │  1 import { Router } from "express";               │
+│   ▾ api/                             2 │  2 import { auth } from "./auth";                  │
+│     routes.ts               Claude  2m │  3                                                 │
+│     auth.ts                 Claude$ 5m │  4 export const router = Router();                 │
+│   ▸ components/forms/                1 │  5                                                 │
+│ ▾ tests/                             1 │  6 router.get("/health", (_req, res) => {          │
+│   routes.test.ts             Grok   1h │  7   res.json({ ok: true });                       │
+│ README.md                   Codex   9m │  8 });                                             │
+└────────────────────────────────────────┴────────────────────────────────────────────────────┘
 ```
 
 ## How it works
@@ -38,8 +42,8 @@ agent's prompt.
    viewer per directory alive in a private tmux server (`tmux -L agent-edits`). The first press
    starts the viewer, and later presses re-attach to it, so hiding the popup keeps its state.
 3. `agent-edits-view` starts Neovim with `nvim/viewer.lua` in that directory. Every logged file
-   is listed, and you can filter the list by agent, session or project. A path is shown relative
-   to the editing session's project, or to the directory, or as `~/...`.
+   is listed under its folder, and you can filter the list by agent, session or project. A path
+   is shown relative to the editing session's project, or to the directory, or as `~/...`.
    The list refreshes every 2 seconds.
 4. The binding also passes the pane's id to the viewer. Selected code is pasted into that pane
    with `tmux paste-buffer -p` (bracketed paste), so the newlines don't submit the prompt.
@@ -88,6 +92,7 @@ The installer:
 
 Running `./install.sh` again is safe: it never adds an entry twice, and it updates an existing
 entry in place, so upgrading is `git pull && ./install.sh`. It backs a file up only when it changes the file.
+A viewer still running from before an upgrade is restarted the next time you open the popup.
 
 Environment overrides: `AGENT_EDITS_BIN_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`.
@@ -99,19 +104,22 @@ is already running in the background, the same key brings it back as you left it
 
 | Key | Where | Action |
 |-----|-------|--------|
-| `j` / `k`, `gg` / `G` | list | Select a file (the preview updates) |
-| `Enter` / `l` | list | Jump into the code |
-| `t` | list | Group the list by agent session (toggle). Each group has a header with the agent, the project, the number of files and the last edit. A file edited by two sessions appears in both groups. |
-| `za` | list | Fold / unfold the session group under the cursor |
+| `j` / `k`, `gg` / `G` | list | Move through the list. The preview follows the file under the cursor. |
+| `Enter` | list | Jump into the code. On a folder or session header, fold / unfold it. |
+| `l` / `h` | list | Open / close a folder, as in a file explorer. `l` on an open folder goes into it, and on a file jumps into the code. `h` on a file closes the folder that holds it. |
+| `za` / `zo` / `zc` | list | Toggle / open / close the folder (or session) under the cursor, or the one that holds the file |
+| `zR` / `zM` | list | Open / close every folder and session |
+| `f` | list | Folder tree (toggle, on by default). Files are listed under their folders, which nest and fold. Every folder and session starts folded: open what you want to see with `l`, or everything with `zR`. A folder with only one subfolder is shown as one row (`src/api/`). Folders are ordered by their newest edit, and each header shows how many files it holds. When the files come from several projects, each project is a top-level folder. With `f` off, each row shows the whole path, the folder dimmed. |
+| `t` | list | Group the list by agent session (toggle). Each group has a header with the agent, the project, the number of files and the last edit. A file edited by two sessions appears in both groups. Inside a session the files are in a folder tree too. |
 | `r` | list | Reload the list now |
 | `a` | list | Filter by agent: all, Claude, Codex, Grok (only the agents in the log) |
 | `s` | list | Show only the session that edited the selected file (toggle) |
 | `p` | list | Show only this project (toggle): files under the directory, or edited by a session started in it, above it or below it |
-| `x` | list | Mark the file as reviewed, or remove the mark. This also works on a visual selection. Reviewed files are dimmed, marked `✓` and moved below the others, and the cursor moves on to the next file to review. A new edit brings the file back as unreviewed. Marks are kept in `reviewed.tsv` and survive restarts. |
+| `x` | list | Mark the file as reviewed, or remove the mark. This also works on a folder (every file in it) and on a visual selection. Reviewed files are dimmed, marked `✓` and moved below the others, and the cursor moves on to the next file to review. A new edit brings the file back as unreviewed. Marks are kept in `reviewed.tsv` and survive restarts. |
 | `X` | list | Hide reviewed files (toggle) |
 | `H` | list | Hide files with nothing left to commit: tracked by git and unchanged since `HEAD` (toggle). Untracked, ignored and non-git files stay visible. The list updates when you commit. |
 | `F` | list | Clear the filters |
-| `@` | list | Paste `@path` into the agent's prompt (a file reference for Claude Code and Codex). Works on a visual selection of rows too. The viewer stays open. |
+| `@` | list | Paste `@path` into the agent's prompt (a file reference for Claude Code and Codex). On a folder it sends the folder. Works on a visual selection of rows too. The viewer stays open. |
 | `]f` / `[f` | anywhere | Next / previous edited file |
 | `Ctrl-h` / `Ctrl-l` | anywhere | Move between the list and the code |
 | `D` | anywhere | Toggle a side-by-side diff of what the agent changed: the file before the session's first edit, next to the file now |
@@ -119,12 +127,16 @@ is already running in the background, the same key brings it back as you left it
 | `]c` / `[c` | anywhere | Next / previous change. Changed lines are marked in the margin (`▎` added or changed, `▁` deleted below), and the code winbar shows `+added ~changed -deleted`. |
 | `o` | anywhere | Open the file in `$VISUAL` / `$EDITOR` (default `nvim`) in a new tmux window next to the agent's. From the code window it opens at the cursor line, from the list at the first change. The popup hides itself. |
 | `O` | anywhere | Same, but in a split next to the agent pane |
+| `R` | code | Revert the change under the cursor to what it was before the agent's session (also in the `D` diff window). Asks first. |
+| `R` | list | Revert the whole file, every file in a folder, or every file in a visual selection of rows. A file the session created is deleted, a file it deleted is written back. Asks first, and marks the files as reviewed. |
 | `Ctrl-z` or `prefix + e` | anywhere | Hide the popup. The viewer keeps running. |
 | `:q`, `:qa`, `ZZ`, `ZQ` | list or code | Quit the viewer, as in plain Neovim |
 | `y` | visual selection | Paste the selected lines into the agent's prompt and keep the viewer open |
 | `d` / `Enter` | visual selection | Paste into the agent's prompt and hide the popup |
 | `c` | visual selection | Ask for a comment, then paste the code followed by the comment. The viewer stays open, so you can queue several comments before you switch to the agent. `Esc` or an empty comment sends nothing. |
 | `:AgentEditsHelp` / `g?` | anywhere | Show these key bindings |
+| `:AgentEditsUndoRevert` | command | Put back what the last `R` replaced. It refuses when a file changed since the revert (the agent may have edited it again); `:AgentEditsUndoRevert!` puts it back anyway. Reverts are kept for 7 days. |
+| `:AgentEditsPatch` | command | Everything the selected file's session changed, as one unified diff, in a new tab (`q` closes it). `:AgentEditsPatch FILE` writes it to `FILE`; `:AgentEditsPatch!` pastes an `@` reference to it into the agent's prompt, for a "review this change" request. Only this project's files while `p` is on. From a shell: `agent-edits-log --patch SESSION [--root DIR]`. |
 | `:AgentEditsClear` | command | Forget this project's edits, after asking for confirmation. This uses the same project rule as `p`. `:AgentEditsClear!` forgets every edit. Snapshots that are no longer used are deleted. |
 
 All other Vim motions work in the code window: search, marks, `%`, `Ctrl-d`/`Ctrl-u`,
@@ -160,6 +172,11 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
 - A file that no longer exists stays in the list, struck through and marked `✗`, when there is a
   snapshot of what it held: `D` shows it. Files an agent created and then removed again
   (scratch files) are hidden.
+- `:AgentEditsPatch` diffs each file against its snapshot. Paths are relative to the git work
+  tree (or the session's directory), so `git apply` and `patch -p1` take it. Files without a
+  snapshot are diffed against `HEAD` inside git; binary files, files over 2 MB and shell edits
+  outside git are listed as `#` comments, not diffed. Two sessions that edited the same file
+  give overlapping patches, each from its own starting point.
 - Log entries older than 14 days are pruned once the log grows past about 1 MB. Snapshots are
   kept as long as their session is still in the log.
   `:AgentEditsClear` clears the history at any time.
@@ -199,11 +216,32 @@ agent-edits/
 │   └── inner.conf          # config of the private tmux server that keeps viewers alive
 ├── lib/
 │   └── config_patch.py     # idempotent add/remove of the hook entries and the tmux block
+├── tests/
+│   ├── run.sh              # runs every test
+│   ├── test_hook.py        # the hook, fed with the events in fixtures/
+│   ├── test_install.py     # install.sh and uninstall.sh against a temporary HOME
+│   ├── test_patch.py       # agent-edits-log --patch applies with git apply and patch -p1
+│   ├── test_popup.py       # the popup starts a viewer once and re-attaches to it
+│   ├── test_viewer.py      # runs viewer/run.lua in a headless Neovim
+│   └── fixtures/           # one hook event per agent and tool
 ├── install.sh
 ├── uninstall.sh
 ├── LICENSE
 └── README.md
 ```
+
+## Development
+
+```sh
+tests/run.sh          # every test, about 5 seconds
+tests/run.sh -v       # one line per test
+tests/run.sh -k shell # only the tests whose name contains "shell"
+```
+
+The tests need `python3`, `git` and Neovim; the tmux ones are skipped without tmux 3.3 or newer.
+They never touch your configuration or your tmux server: each test gets a temporary `HOME`,
+state directory and `TMUX_TMPDIR`. GitHub Actions runs them on Linux and macOS, with the
+oldest supported Python and Neovim too, and runs `shellcheck` on the shell scripts.
 
 ## License
 

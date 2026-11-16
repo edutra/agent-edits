@@ -1,0 +1,53 @@
+name: test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, Python ${{ matrix.python }}, Neovim ${{ matrix.nvim }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest versions the README supports. Its tmux (3.2) is older
+          # than install.sh accepts, so the tmux parts of the install tests are
+          # skipped there.
+          - os: ubuntu-22.04
+            python: "3.8"
+            nvim: v0.10.4
+          - os: ubuntu-latest
+            python: "3.x"
+            nvim: stable
+          - os: macos-latest
+            python: "3.x"
+            nvim: stable
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.nvim }}
+      - name: Install tmux
+        run: |
+          if command -v brew >/dev/null; then
+            brew install tmux
+          else
+            sudo apt-get update && sudo apt-get install -y tmux
+          fi
+      - name: Versions
+        run: python --version && nvim --version | head -1 && tmux -V && git --version
+      - name: Tests
+        run: PYTHON=python tests/run.sh -v
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck bin/agent-edits-popup bin/agent-edits-view install.sh uninstall.sh tests/run.sh
