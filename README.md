@@ -177,8 +177,8 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
   edits along; a tmux server restart starts every window empty.
 - `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
 - A file that no longer exists stays in the list, struck through and marked `✗`, when there is a
-  snapshot of what it held: `D` shows it. Files an agent created and then removed again
-  (scratch files) are hidden.
+  snapshot of what it held: `D` shows it. A deleted folder is marked the same way. Files an
+  agent created and then removed again (scratch files) are hidden.
 - `:AgentEditsPatch` diffs each file against its snapshot. Paths are relative to the git work
   tree (or the session's directory), so `git apply` and `patch -p1` take it. Files without a
   snapshot are diffed against `HEAD` inside git; binary files, files over 2 MB and shell edits

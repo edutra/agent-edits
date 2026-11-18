@@ -392,11 +392,13 @@ local function new_folder(key, label, path)
 end
 
 -- A folder with nothing but one subfolder becomes one row: "src/api/".
+-- deleted: the folder is gone from the disk (its files are all deleted).
 local function compact(f)
   while not f.project and #f.items == 1 and f.items[1].folder do
     local sub = f.items[1].folder
     f.label, f.key, f.path, f.items = f.label .. "/" .. sub.label, sub.key, sub.path, sub.items
   end
+  f.deleted = f.path ~= "" and vim.uv.fs_stat(f.path) == nil
   for _, item in ipairs(f.items) do
     if item.folder then compact(item.folder) end
   end
@@ -534,9 +536,12 @@ local function row_chunks(row)
     for _, e in ipairs(f.files) do
       if not e.reviewed then todo = todo + 1 end
     end
+    local right = { { " " } }
+    if f.deleted then right[#right + 1] = { "✗ ", "Removed", keep = true } end
+    right[#right + 1] = { tostring(#f.files), "AgentEditsMeta" }
     return { indent, { (is_folded(f.key) and "▸" or "▾") .. " ", "AgentEditsFoldMark" },
       { f.label .. "/", f.project and "Title" or "AgentEditsFolder", cut = true } },
-      { { " " .. #f.files, "AgentEditsMeta" } }, todo == 0 and "Comment" or nil
+      right, f.deleted and "AgentEditsDeleted" or (todo == 0 and "Comment" or nil)
   end
   local e = row.entry
   local left = { indent }
@@ -1671,6 +1676,7 @@ local HELP = {
   " Claude$ (a $ after the agent): the edit was inferred from a shell",
   " command; files changed meanwhile by something else may show up too.",
   " ✗ (struck through): the file was deleted; D shows what it held.",
+  " On a folder: the folder was deleted, with every file in it.",
   "",
   " All other Vim motions work as usual; buffers are read-only.",
   " Close this help with q or Esc.",
