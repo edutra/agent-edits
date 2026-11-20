@@ -7,8 +7,8 @@ the **Claude Code**, **Codex** or **Grok** agents running in that tmux window ed
 window (tab) has its own list: switch windows and you see the files of the agents there. Git is
 not required. The newest
 edits are at the top, grouped by folder. Moving through the list previews each file read-only, and the preview
-follows the agent live while it works. Select lines and press `y` or `d` to paste them into the
-agent's prompt.
+follows the agent live while it works. Files an agent created are marked `+`. Select lines and
+press `y` or `d` to paste them into the agent's prompt.
 
 ```
 ┌ Edits (5)  my-project ─────────────────┬ src/api/routes.ts  (Claude, 2m ago) ───────────────┐
@@ -18,7 +18,7 @@ agent's prompt.
 │     auth.ts                 Claude$ 5m │  4 export const router = Router();                 │
 │   ▸ components/forms/                1 │  5                                                 │
 │ ▾ tests/                             1 │  6 router.get("/health", (_req, res) => {          │
-│   routes.test.ts             Grok   1h │  7   res.json({ ok: true });                       │
+│   routes.test.ts           + Grok   1h │  7   res.json({ ok: true });                       │
 │ README.md                   Codex   9m │  8 });                                             │
 └────────────────────────────────────────┴────────────────────────────────────────────────────┘
 ```
@@ -45,7 +45,9 @@ agent's prompt.
    in a window starts its viewer, and later presses re-attach to it, so hiding the popup keeps its
    state. A viewer ends when its window is closed.
 3. `agent-edits-view` starts Neovim with `nvim/viewer.lua` in the pane's directory. Every file
-   edited from one of the window's panes is listed under its folder (`w` lists every window's), and you can filter the list by agent, session or project. A path
+   edited from one of the window's panes is listed under its folder (`w` lists every window's), and you can filter the list by agent, session or project.
+   Agents running outside tmux, such as Claude Code's background agents, count for every
+   window with a pane in their project. A path
    is shown relative to the editing session's project, or to the directory, or as `~/...`.
    The list refreshes every 2 seconds.
 4. The binding also passes the pane's id to the viewer. Selected code is pasted into that pane
@@ -172,13 +174,18 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
   Inside git, committed files a command deletes (`rm`, `git rm`) are recorded too, with their
   `HEAD` version as the snapshot. Deleting untracked files, or files outside git, is not seen.
 - Only edits made after you install the hook are recorded.
-- Edits logged before the hook recorded the tmux pane, and edits by agents running outside tmux,
-  belong to no window: `w` shows them. An agent moved to another window (`join-pane`) takes its
-  edits along; a tmux server restart starts every window empty.
+- Edits logged before the hook recorded the tmux pane belong to no window: `w` shows them.
+  Agents running outside tmux can't be tied to a pane: Claude Code's background agents, for
+  example, run without the tmux environment. Their edits show up in each window that has a pane
+  in their project (the agent's directory, or a folder inside it or above it, but not `$HOME`
+  or `/`). An agent moved to another window (`join-pane`) takes its edits along; a tmux server
+  restart starts every window empty.
 - `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
+- A file is marked `+` (created) when the hook found nothing to snapshot before the session's
+  first edit, so files created by shell commands are not marked (they have no snapshot).
 - A file that no longer exists stays in the list, struck through and marked `✗`, when there is a
-  snapshot of what it held: `D` shows it. Files an agent created and then removed again
-  (scratch files) are hidden.
+  snapshot of what it held: `D` shows it. A deleted folder is marked the same way. Files an
+  agent created and then removed again (scratch files) are hidden.
 - `:AgentEditsPatch` diffs each file against its snapshot. Paths are relative to the git work
   tree (or the session's directory), so `git apply` and `patch -p1` take it. Files without a
   snapshot are diffed against `HEAD` inside git; binary files, files over 2 MB and shell edits

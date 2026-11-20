@@ -221,6 +221,29 @@ test("deleted files with a baseline are listed", function()
   eq(V().stats[e.path], { add = 0, change = 0, delete = 2 }, "stats")
 end)
 
+test("a deleted folder is marked", function()
+  file("kept/a.txt")
+  baseline("s1", "old/sub/b.txt", "b\n")
+  baseline("s1", "kept/c.txt", "c\n")
+  log({ { 5, "Claude", "kept/a.txt" }, { 10, "Claude", "old/sub/b.txt" }, { 15, "Claude", "kept/c.txt" } })
+  eq(kinds(), { "kept/", "kept/a.txt", "kept/c.txt", "old/sub/", "old/sub/b.txt" }, "rows")
+  -- A folder that still exists is not marked, even with a deleted file in it.
+  eq(lines()[1]:find("✗", 1, true), nil, "kept/ marked: " .. lines()[1])
+  has(lines()[4], "✗", "old/sub/ row")
+  eq(V().rows[4].folder.deleted, true, "old/sub/ deleted")
+  eq(V().rows[1].folder.deleted, false, "kept/ deleted")
+end)
+
+test("files the session created are marked +", function()
+  file("made.txt", "a\nb\n")
+  file("changed.txt", "new\n")
+  write(state .. "/baselines/s1/" .. vim.fn.sha256(abs("made.txt")) .. ".new", "")
+  baseline("s1", "changed.txt", "old\n")
+  log({ { 10, "Claude", "made.txt" }, { 20, "Claude", "changed.txt" } })
+  has(row_text("made.txt"), "+ Claude", "created row")
+  eq(row_text("changed.txt"):find("+", 1, true), nil, "edited row")
+end)
+
 test("change markers count added, changed and deleted lines", function()
   baseline("s1", "m.txt", "a\nb\nc\nd\n")
   file("m.txt", "a\nB\nc\nnew\n")
@@ -458,11 +481,12 @@ end)
 
 -- One tmux window ------------------------------------------------------------------
 
--- The viewer as if opened from a tmux window holding `panes`.
-local function in_window(panes, label)
+-- The viewer as if opened from a tmux window holding `panes`, which are in
+-- the directories `dirs`.
+local function in_window(panes, label, dirs)
   local set = {}
   for _, p in ipairs(panes) do set[p] = true end
-  V().current_tab = function() return { panes = set, label = label or "window 1" } end
+  V().current_tab = function() return { panes = set, label = label or "window 1", dirs = dirs } end
   refresh()
 end
 
@@ -481,6 +505,29 @@ test("only the files the agents of this tmux window edited", function()
   eq(#names(), 4, "w shows every window")
   keys("w")
   eq(#names(), 2, "w again")
+end)
+
+test("agents outside tmux show in the windows working in their project", function()
+  local other = vim.fn.fnamemodify(root, ":h") .. "/other"
+  file("bg.txt") file("sub/deep.txt") file("old.txt") file("mine.txt")
+  write(other .. "/elsewhere.txt")
+  -- pane "-": a background agent, which runs without the tmux environment.
+  log({ { 10, "Claude", "bg.txt", pane = "-" }, { 20, "Claude", "sub/deep.txt", project = root .. "/sub", pane = "-" },
+    { 30, "Claude", other .. "/elsewhere.txt", project = other, pane = "-" },
+    { 5, "Codex", "mine.txt", pane = "100:%1", session = "s2" } })
+  -- A line from before the pane column belongs to no window.
+  append((NOW - 40) .. "\tClaude\t" .. abs("old.txt") .. "\t" .. root .. "\ts0\ttool\n")
+  in_window({ "100:%1" }, "window 1", { root })
+  eq(names(), { "mine.txt", "bg.txt", "deep.txt" }, "this window's project")
+  in_window({ "100:%1" }, "window 1", { root .. "/sub" })
+  eq(names(), { "mine.txt", "bg.txt", "deep.txt" }, "a pane below the project")
+  in_window({ "100:%1" }, "window 1", { other })
+  eq(names(), { "mine.txt", "elsewhere.txt" }, "another project")
+  keys("t")
+  eq(kinds(), { "[Codex]", "mine.txt", "[Claude]", "elsewhere.txt" }, "sessions")
+  keys("t")
+  in_window({ "100:%1" }, "window 1", {})
+  eq(names(), { "mine.txt" }, "no directory")
 end)
 
 test("another tmux server, another pane", function()
