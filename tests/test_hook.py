@@ -132,6 +132,16 @@ class ShellTests(StateTest):
         self.assertEqual(sorted(self.logged_paths()), [self.path("new.txt"), self.path("tracked.txt")])
         self.assertEqual({row[5] for row in self.log()}, {"shell"})
 
+    def test_repository_without_commits_skips_ignored_files(self):
+        self.git("init", "-q")
+        self.write(".gitignore", "build/\n")
+
+        def change():
+            self.write("main.txt")
+            self.write("build/out.bin")
+        self.shell("claude-bash", change)
+        self.assertEqual(self.logged_paths(), [self.path("main.txt")])
+
     def test_files_changed_before_the_command_are_not_logged(self):
         self.init_repo({"dirty.txt": "a\n"})
         self.write("dirty.txt", "changed earlier\n")
@@ -247,6 +257,17 @@ class PruneTests(StateTest):
         self.assertEqual(self.logged_paths(), ["/x/b", "/x/c"])
         self.assertEqual(sorted(os.listdir(os.path.join(self.state, "baselines"))),
                          ["active", "inflight"])
+
+    def test_big_log_of_recent_edits_is_not_rewritten(self):
+        now = int(time.time())
+        rows = [(now, "Claude", f"/x/f{i}", "/x", "s", "tool") for i in range(30000)]
+        # Out of order, so a rewrite would drop it: only the first (oldest)
+        # line decides whether the log is pruned.
+        rows.append((now - 20 * 86400, "Claude", "/x/late", "/x", "s", "tool"))
+        self.write_log(rows)  # over 1 MB
+        self.hook(event("claude-edit", file="/x/c", cwd="/x"))
+        self.assertEqual(len(self.log()), 30002)
+        self.assertIn("/x/late", self.logged_paths())
 
     def test_small_log_is_left_alone(self):
         old = int(time.time()) - 20 * 86400

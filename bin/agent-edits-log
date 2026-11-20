@@ -9,9 +9,10 @@ PreToolUse   saves a baseline of each file the tool is about to touch, once
              per agent session, in baselines/<session>/<sha256(path)>, so the
              viewer can diff against the file as it was before the session.
 PostToolUse  appends one line per edited file to edits.tsv:
-               <epoch> <agent> <path> <project> <session> <via>
+               <epoch> <agent> <path> <project> <session> <via> <pane>
              <project> is the directory the agent session was started in;
-             <via> is "tool".
+             <via> is "tool"; <pane> is the agent's tmux pane ("-" outside
+             tmux).
 Shell tools (Bash and friends):
 PreToolUse   notes the start time and working directory of the command, and
              inside git the committed files already missing there.
@@ -38,16 +39,17 @@ Everything lives in $XDG_STATE_HOME/agent-edits. Works with Claude Code
 and Codex (apply_patch patch text). It never fails the agent: any error is
 swallowed and the exit code is always 0.
 """
-import difflib
 import fcntl
 import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
+
+# subprocess, shutil and difflib are imported where they are used: most
+# events need none of them, and together they add about a third to the
+# hook's run time, which every edit of every agent waits for.
 
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
@@ -152,17 +154,27 @@ def save_baselines(session, paths):
         elif not os.path.isfile(path) or os.path.getsize(path) > MAX_BASELINE_BYTES:
             open(base + ".skip", "w").close()
         else:
-            shutil.copyfile(path, base + ".tmp")
+            with open(path, "rb") as src, open(base + ".tmp", "wb") as dst:
+                dst.write(src.read())
             os.replace(base + ".tmp", base)
 
 
 def prune():
-    """Drop log lines and baselines older than KEEP_SECONDS once the log is big."""
+    """Drop log lines and baselines older than KEEP_SECONDS once the log is big.
+
+    Lines are appended in time order, so the first one is the oldest. The log
+    is rewritten only once that line is a day past KEEP_SECONDS: a big log of
+    recent edits is left alone, instead of being rewritten on every edit, and
+    each rewrite drops at least a day of lines."""
     try:
         if os.path.getsize(LOG) < PRUNE_BYTES:
             return
         cutoff = time.time() - KEEP_SECONDS
         with open(LOG, encoding="utf-8", errors="replace") as fh:
+            first = fh.readline().split("\t", 1)[0]
+            if first.isdigit() and int(first) >= cutoff - 86400:
+                return
+            fh.seek(0)
             lines = [l for l in fh if l.split("\t", 1)[0].isdigit() and int(l.split("\t", 1)[0]) >= cutoff]
         with open(LOG, "w", encoding="utf-8") as fh:
             fh.writelines(lines)
@@ -170,6 +182,7 @@ def prune():
         # the folder's mtime only changes when a file is added to it, so a long
         # session would otherwise lose the baselines of its first edits.
         sessions = {l.rstrip("\n").split("\t")[4] for l in lines if l.count("\t") >= 4}
+        import shutil
         if os.path.isdir(BASELINES):
             for entry in os.scandir(BASELINES):
                 if (entry.is_dir() and entry.name not in sessions
@@ -204,6 +217,8 @@ def log_edits(event, paths, cwd, via="tool"):
     with open(LOG, "a", encoding="utf-8") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         fh.writelines(f"{now}\t{agent}\t{p}\t{project}\t{session}\t{via}\t{pane}\n" for p in paths)
+        # prune() reads the log: the new lines first.
+        fh.flush()
         prune()
 
 
@@ -225,28 +240,37 @@ def pending_file(event):
     return os.path.join(PENDING, name)
 
 
-def git_paths(workdir, args):
-    """Absolute paths a git command prints (NUL separated, relative to
-    workdir), or None outside git. A directory ignored by an enclosing
-    repository (e.g. a project inside a dotfiles repo) counts as outside."""
+def git(folder, *args):
+    """Runs git in folder: the CompletedProcess, or None when git couldn't
+    run (missing, timed out)."""
+    import subprocess
     try:
-        out = subprocess.run(["git", "-C", workdir] + args, capture_output=True, timeout=3)
-        if out.returncode != 0:
-            return None
-        if subprocess.run(["git", "-C", workdir, "check-ignore", "-q", "."],
-                          capture_output=True, timeout=3).returncode == 0:
-            return None
+        return subprocess.run(["git", "-C", folder, *args], capture_output=True, timeout=3)
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def git_paths(workdir, args, in_git=False):
+    """Absolute paths a git command prints (NUL separated, relative to
+    workdir), or None outside git. A directory ignored by an enclosing
+    repository (e.g. a project inside a dotfiles repo) counts as outside;
+    in_git: the caller knows it is not."""
+    out = git(workdir, *args)
+    if out is None or out.returncode != 0:
+        return None
+    if not in_git:
+        ignored = git(workdir, "check-ignore", "-q", ".")
+        if ignored is None or ignored.returncode == 0:
+            return None
     return [os.path.normpath(os.path.join(workdir, p.decode(errors="surrogateescape")))
             for p in out.stdout.split(b"\0") if p]
 
 
-def deleted_files(workdir):
+def deleted_files(workdir, in_git=False):
     """Files under workdir that are in HEAD but gone from the disk (also after
     a git rm), or None outside git or before the first commit."""
     return git_paths(workdir, ["diff", "HEAD", "--relative", "--no-renames", "--name-only",
-                               "--diff-filter=D", "-z", "--", "."])
+                               "--diff-filter=D", "-z", "--", "."], in_git)
 
 
 def save_head_baselines(session, workdir, paths):
@@ -261,13 +285,8 @@ def save_head_baselines(session, workdir, paths):
         base = os.path.join(folder, baseline_key(path))
         if any(os.path.exists(base + ext) for ext in ("", ".new", ".skip")):
             continue
-        try:
-            out = subprocess.run(
-                ["git", "-C", workdir, "show", "HEAD:./" + os.path.relpath(path, workdir)],
-                capture_output=True, timeout=3)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if out.returncode != 0:
+        out = git(workdir, "show", "HEAD:./" + os.path.relpath(path, workdir))
+        if out is None or out.returncode != 0:
             continue
         if len(out.stdout) > MAX_BASELINE_BYTES:
             open(base + ".skip", "w").close()
@@ -277,9 +296,10 @@ def save_head_baselines(session, workdir, paths):
         os.replace(base + ".tmp", base)
 
 
-def changed_since(workdir, start_ns):
-    """Files under workdir modified at or after start_ns (nanoseconds)."""
-    candidates = git_paths(workdir, ["ls-files", "-m", "-o", "--exclude-standard", "-z", "--", "."])
+def changed_since(workdir, start_ns, in_git=False):
+    """Files under workdir modified at or after start_ns (nanoseconds).
+    in_git: workdir is known to be in a git work tree (see git_paths)."""
+    candidates = git_paths(workdir, ["ls-files", "-m", "-o", "--exclude-standard", "-z", "--", "."], in_git)
     if candidates is None:
         candidates = []
         deadline, seen = time.monotonic() + WALK_SECONDS, 0
@@ -329,10 +349,13 @@ def handle_shell(event, cwd):
     except OSError:
         return
     start, _, workdir = head.partition("\t")
-    paths = changed_since(workdir, int(start))
-    if rest.startswith("git"):
+    # PreToolUse found workdir in a work tree with commits. Without (no git,
+    # or no commit yet) changed_since asks git again.
+    in_git = rest.startswith("git")
+    paths = changed_since(workdir, int(start), in_git)
+    if in_git:
         before = set(rest.split("\0")[1:])
-        gone = [p for p in deleted_files(workdir) or [] if p not in before]
+        gone = [p for p in deleted_files(workdir, True) or [] if p not in before]
         save_head_baselines(session_id(event), workdir, gone)
         paths += gone[:MAX_SHELL_FILES]
     if paths:
@@ -377,6 +400,7 @@ def clear(root, dry_run):
             fh.writelines(kept)
             fh.truncate()
             sessions = {l.rstrip("\n").split("\t")[4] for l in kept if l.count("\t") >= 4}
+            import shutil
             if os.path.isdir(BASELINES):
                 for entry in os.scandir(BASELINES):
                     if entry.is_dir() and entry.name not in sessions:
@@ -424,13 +448,10 @@ def git_top(folder):
     a folder an enclosing repository ignores)."""
     if git_paths(folder, ["rev-parse"]) is None:
         return None
-    try:
-        out = subprocess.run(["git", "-C", folder, "rev-parse", "--show-toplevel"],
-                             capture_output=True, timeout=3)
-    except (OSError, subprocess.SubprocessError):
+    out = git(folder, "rev-parse", "--show-toplevel")
+    if out is None or out.returncode != 0:
         return None
-    top = out.stdout.decode(errors="surrogateescape").rstrip("\n")
-    return top if out.returncode == 0 and top else None
+    return out.stdout.decode(errors="surrogateescape").rstrip("\n") or None
 
 
 def head_version(path):
@@ -441,10 +462,8 @@ def head_version(path):
         folder = os.path.dirname(folder)
     if git_top(folder) is None:
         return False, None
-    try:
-        out = subprocess.run(["git", "-C", folder, "show", "HEAD:./" + os.path.relpath(path, folder)],
-                             capture_output=True, timeout=3)
-    except (OSError, subprocess.SubprocessError):
+    out = git(folder, "show", "HEAD:./" + os.path.relpath(path, folder))
+    if out is None:
         return False, None
     return True, out.stdout if out.returncode == 0 else None
 
@@ -456,6 +475,7 @@ def file_diff(name, old, new):
         return None
     if b"\0" in (old or b"") or b"\0" in (new or b""):
         return f"# {name}: binary file changed, skipped\n"
+    import difflib
     def lines(data):
         # Only "\n" ends a line (str.splitlines also splits on \r, \f...).
         return re.findall(r"[^\n]*\n|[^\n]+", (data or b"").decode("utf-8", "surrogateescape"))
