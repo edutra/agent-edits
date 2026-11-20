@@ -117,9 +117,12 @@ local function read_log()
     local f = vim.split(line, "\t", { plain = true })
     local ts, path = tonumber(f[1]), f[3]
     if ts and path and path ~= "" then
+      -- outside: the agent ran outside tmux (lines older than the pane
+      -- column don't say).
       local e = {
         ts = ts, agent = f[2], path = path,
         project = f[4] or "", session = f[5] or "-", via = f[6] or "tool", pane = f[7] or "-",
+        outside = f[7] == "-",
       }
       e.rel, e.base = display_name(path, f[4])
       if not c.latest[path] or c.latest[path].ts <= ts then c.latest[path] = e end
@@ -139,6 +142,31 @@ local function baseline_file(e)
   return baselines_dir .. "/" .. e.session .. "/" .. vim.fn.sha256(e.path)
 end
 
+local home = vim.env.HOME
+
+-- "This project": the file is under `dir` (default: the viewer's directory),
+-- or the session that edited it was started in that directory, below it, or
+-- above it (except $HOME and /, which are not projects).
+local function in_project(e, dir)
+  dir = dir or root
+  if under(e.path, dir) then return true end
+  local project = e.project or ""
+  if project == "" then return false end
+  if under(project, dir) then return true end
+  return under(dir, project) and project ~= home and project ~= "/"
+end
+
+-- An edit by an agent running outside tmux, such as a Claude Code background
+-- agent (they run without the tmux environment), belongs to every window
+-- with a pane in its project.
+local function near_tab(e)
+  if not e.outside then return false end
+  for _, dir in ipairs(M.tab.dirs or {}) do
+    if in_project(e, dir) then return true end
+  end
+  return false
+end
+
 -- The logged files to list, newest first, in both shapes (see read_log).
 -- A file that no longer exists stays listed, marked deleted, when there is a
 -- baseline to show what it held: the agent deleted it, or it was deleted
@@ -150,7 +178,8 @@ local function read_entries()
   local log = read_log()
   local latest = log.latest
   local shown, sessions = latest, log.per_session
-  -- One tmux window: only the edits made from its panes.
+  -- One tmux window: only the edits made from its panes, and those of the
+  -- agents outside tmux working in its projects.
   local panes = M.tab_only and M.tab and M.tab.panes
   if panes then
     shown, sessions = {}, {}
@@ -158,7 +187,9 @@ local function read_entries()
       if panes[e.pane] and (not shown[e.path] or shown[e.path].ts < e.ts) then shown[e.path] = e end
     end
     for key, e in pairs(log.per_session) do
-      if panes[e.pane] then sessions[key] = e end
+      local outside = near_tab(e)
+      if outside and (not shown[e.path] or shown[e.path].ts < e.ts) then shown[e.path] = e end
+      if panes[e.pane] or outside then sessions[key] = e end
     end
   end
   -- Reviewed until anyone edits the file again.
@@ -178,6 +209,11 @@ local function read_entries()
         local base = baseline_file(e)
         e.has_baseline = base ~= nil and vim.uv.fs_stat(base) ~= nil
       end
+      -- The session created the file: the hook found nothing to save before it.
+      if e.created == nil then
+        local base = baseline_file(e)
+        e.created = base ~= nil and vim.uv.fs_stat(base .. ".new") ~= nil
+      end
       if not e.deleted or e.has_baseline then out[#out + 1] = e end
     end
     return sort_entries(out)
@@ -188,19 +224,7 @@ end
 -- Filters ------------------------------------------------------------------
 -- a: one agent; s: the session of the selected file; p: this project only.
 
-local home = vim.env.HOME
 M.filters = { agent = nil, session = nil, project = false }
-
--- "This project": the file is under the viewer's directory, or the session
--- that edited it was started in that directory, below it, or above it
--- (except $HOME and /, which are not projects).
-local function in_project(e)
-  if under(e.path, root) then return true end
-  local project = e.project or ""
-  if project == "" then return false end
-  if under(project, root) then return true end
-  return under(root, project) and project ~= home and project ~= "/"
-end
 
 -- Hide committed files (H) ----------------------------------------------------
 -- A file is "committed" when it is in a git repository and git status reports
@@ -556,7 +580,11 @@ local function row_chunks(row)
   end
   local right = { { " " } }
   if e.reviewed then right[#right + 1] = { "✓ ", "AgentEditsReviewedMark", keep = true } end
-  if e.deleted then right[#right + 1] = { "✗ ", "Removed", keep = true } end
+  if e.deleted then
+    right[#right + 1] = { "✗ ", "Removed", keep = true }
+  elseif e.created then
+    right[#right + 1] = { "+ ", "Added", keep = true }
+  end
   -- In the session view the header names the agent.
   if not M.grouped then right[#right + 1] = { e.agent, agent_hl(e.agent) } end
   right[#right + 1] = { e.via == "shell" and "$" or " ", "AgentEditsMeta" }
@@ -628,8 +656,8 @@ local function inner_option(name)
 end
 
 -- The popup's tmux window: { panes = set of "<server pid>:<pane id>",
--- label }, nil outside the popup, or { gone = true } once the window is
--- closed. Tests replace it.
+-- dirs = the panes' directories (not $HOME or /), label }, nil outside the
+-- popup, or { gone = true } once the window is closed. Tests replace it.
 function M.current_tab()
   if vim.env.AGENT_EDITS_POPUP ~= "1" or not vim.env.TMUX then return nil end
   local socket = inner_option("@ae_socket")
@@ -637,13 +665,16 @@ function M.current_tab()
   if window == "" then window = inner_option("@ae_pane") end
   if socket == "" or window == "" then return nil end
   local out = vim.fn.systemlist({ "tmux", "-S", socket, "list-panes", "-t", window,
-    "-F", "#{pid} #{pane_id} #{window_index} #{window_name}" })
+    "-F", "#{pid}\t#{pane_id}\t#{window_index}\t#{pane_current_path}\t#{window_name}" })
   if vim.v.shell_error ~= 0 then return { gone = true } end
-  local tab = { panes = {} }
+  local tab = { panes = {}, dirs = {} }
   for _, l in ipairs(out) do
-    local pid, pane, index, name = l:match("^(%d+) (%%%d+) (%d+) ?(.*)$")
+    local pid, pane, index, dir, name = l:match("^(%d+)\t(%%%d+)\t(%d+)\t([^\t]*)\t?(.*)$")
     if pid then
       tab.panes[pid .. ":" .. pane] = true
+      if dir ~= "" and dir ~= home and dir ~= "/" and not vim.tbl_contains(tab.dirs, dir) then
+        tab.dirs[#tab.dirs + 1] = dir
+      end
       -- Agents set long window titles: keep the start.
       if vim.fn.strchars(name) > 16 then name = vim.fn.strcharpart(name, 0, 15) .. "…" end
       tab.label = tab.label or ("window " .. index .. (name ~= "" and (" " .. name) or ""))
@@ -688,7 +719,8 @@ local function refresh(force)
   end
   local entries = apply_filters(all)
   M.total, M.all = #all, all
-  local sig = { git_sig, M.reviewed_raw, M.tab_only and M.tab and M.tab.label or "" }
+  local tab = M.tab_only and M.tab
+  local sig = { git_sig, M.reviewed_raw, tab and (tab.label .. "\0" .. table.concat(tab.dirs or {}, "\0")) or "" }
   for _, e in ipairs(per_session) do
     sig[#sig + 1] = e.ts .. e.session .. e.path .. (e.deleted and "\tdeleted" or "")
   end
@@ -1675,6 +1707,7 @@ local HELP = {
   "",
   " Claude$ (a $ after the agent): the edit was inferred from a shell",
   " command; files changed meanwhile by something else may show up too.",
+  " + (green): the agent's session created the file.",
   " ✗ (struck through): the file was deleted; D shows what it held.",
   " On a folder: the folder was deleted, with every file in it.",
   "",
