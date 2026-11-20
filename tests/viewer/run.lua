@@ -262,6 +262,30 @@ test("change markers count added, changed and deleted lines", function()
   eq(V().stats[abs("m.txt")], want, "stats after the agent changed it")
 end)
 
+test("a file shown again is reloaded if it changed meanwhile", function()
+  file("first.txt", "one\n") file("second.txt", "two\n")
+  log({ { 10, "Claude", "first.txt" }, { 20, "Claude", "second.txt" } })
+  select("first.txt")
+  select("second.txt")
+  -- The timer only checks the file shown; 'autoread' reloads this one when
+  -- it is shown again.
+  file("first.txt", "one, then more\n")
+  select("first.txt")
+  eq(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(V().code_win), 0, -1, false),
+    { "one, then more" }, "lines")
+end)
+
+test("hidden, the list refreshes slowly, and at once when shown again", function()
+  file("a.txt") file("b.txt")
+  log({ { 10, "Claude", "a.txt" } })
+  vim.api.nvim_exec_autocmds("FocusLost", {})
+  eq(V().timer:get_repeat(), 30000, "hidden")
+  append(line({ 5, "Claude", "b.txt" }))
+  vim.api.nvim_exec_autocmds("FocusGained", {})
+  eq(V().timer:get_repeat(), 2000, "shown")
+  eq(names(), { "b.txt", "a.txt" }, "caught up")
+end)
+
 test("a cycles the agent filter", function()
   file("a.txt") file("b.txt") file("c.txt")
   log({ { 30, "Grok", "c.txt" }, { 20, "Codex", "b.txt" }, { 10, "Claude", "a.txt" } })
