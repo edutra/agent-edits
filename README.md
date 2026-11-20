@@ -51,7 +51,8 @@ lines and press `y` or `d` to paste them into the agent's prompt.
    Agents running outside tmux, such as Claude Code's background agents, count for every
    window with a pane in their project. A path
    is shown relative to the editing session's project, or to the directory, or as `~/...`.
-   The list refreshes every 2 seconds.
+   The list refreshes every 2 seconds while the popup is open, and every 30 seconds while it
+   is hidden; it catches up as soon as the popup opens again.
 4. The binding also passes the pane's id to the viewer. Selected code is pasted into that pane
    with `tmux paste-buffer -p` (bracketed paste), so the newlines don't submit the prompt.
 
@@ -226,11 +227,11 @@ It keeps the backups. To roll back completely, copy a `*.bak-agent-edits-*` file
 ```
 agent-edits/
 ├── bin/
-│   ├── agent-edits-log     # PostToolUse hook: parses the event, appends to the log
+│   ├── agent-edits-log     # the hook: snapshots, the log; maintenance commands for the viewer
 │   ├── agent-edits-view    # starts Neovim with the viewer for a directory
 │   └── agent-edits-popup   # runs in the popup: starts or re-attaches the background viewer
 ├── nvim/
-│   └── viewer.lua          # list + preview UI, keymaps, live refresh, diff
+│   └── viewer.lua          # list + preview UI, keymaps, live refresh, inline and side-by-side diff
 ├── tmux/
 │   └── inner.conf          # config of the private tmux server that keeps viewers alive
 ├── lib/

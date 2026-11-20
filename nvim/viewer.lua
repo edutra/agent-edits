@@ -376,7 +376,7 @@ local function preview(e, force)
     if M.current_session ~= e.session then
       M.current_session = e.session
       diff_off()
-      if M.update_markers then M.update_markers(e) end
+      M.update_markers(e)
     end
     set_code_winbar(e)
     return
@@ -387,7 +387,7 @@ local function preview(e, force)
     vim.cmd("silent! keepalt edit " .. vim.fn.fnameescape(e.path))
     vim.bo.modifiable = false
   end)
-  if M.update_markers then M.update_markers(e) end
+  M.update_markers(e)
   set_code_winbar(e)
 end
 
@@ -655,15 +655,28 @@ local function inner_option(name)
   return vim.v.shell_error == 0 and vim.trim(out) or ""
 end
 
+-- The popup names a viewer's session after its tmux server and window, so
+-- they never change: read once. (The pane does: see agent_target.)
+local tab_target
+
 -- The popup's tmux window: { panes = set of "<server pid>:<pane id>",
 -- dirs = the panes' directories (not $HOME or /), label }, nil outside the
 -- popup, or { gone = true } once the window is closed. Tests replace it.
 function M.current_tab()
   if vim.env.AGENT_EDITS_POPUP ~= "1" or not vim.env.TMUX then return nil end
-  local socket = inner_option("@ae_socket")
-  local window = inner_option("@ae_window")
-  if window == "" then window = inner_option("@ae_pane") end
-  if socket == "" or window == "" then return nil end
+  local target = tab_target
+  if not target then
+    target = { socket = inner_option("@ae_socket"), window = inner_option("@ae_window") }
+    if target.socket ~= "" and target.window ~= "" then
+      tab_target = target
+    else
+      -- Before the popup set them, or from a popup that couldn't name the
+      -- window: the pane stands for it, read again every time.
+      target.window = inner_option("@ae_pane")
+      if target.socket == "" or target.window == "" then return nil end
+    end
+  end
+  local socket, window = target.socket, target.window
   local out = vim.fn.systemlist({ "tmux", "-S", socket, "list-panes", "-t", window,
     "-F", "#{pid}\t#{pane_id}\t#{window_index}\t#{pane_current_path}\t#{window_name}" })
   if vim.v.shell_error ~= 0 then return { gone = true } end
@@ -1732,11 +1745,12 @@ end
 -- x marks the file(s) as reviewed, or removes the mark. The mark stores the
 -- time of the latest edit, so a newer edit brings the file back.
 local function toggle_reviewed(first, last)
-  local paths, unmark = {}, nil
+  local paths, picked, unmark = {}, {}, nil
   local header = first == last and header_key(M.rows[first])
   for row = first, last do
     for _, e in ipairs(row_files(M.rows[row])) do
-      if not vim.tbl_contains(paths, e.path) then
+      if not picked[e.path] then
+        picked[e.path] = true
         paths[#paths + 1] = e.path
         -- The first file decides: reviewed ones get unmarked, others marked.
         -- In a folder the files to review come first.
@@ -1748,7 +1762,7 @@ local function toggle_reviewed(first, last)
   local ts = 0
   if not unmark then
     for _, e in ipairs(M.all or {}) do
-      if vim.tbl_contains(paths, e.path) then ts = math.max(ts, e.ts) end
+      if picked[e.path] then ts = math.max(ts, e.ts) end
     end
   end
   vim.fn.system(vim.list_extend({ log_cmd, "--reviewed", tostring(ts) }, paths))
@@ -1965,14 +1979,14 @@ local function set_highlights()
   local function hl(name) return vim.api.nvim_get_hl(0, { name = name, link = false }) end
   local normal = hl("Normal")
   local bg = normal.bg or (vim.o.background == "light" and 0xffffff or 0x000000)
-  local added = hl("Added")
+  local added, diff_add = hl("Added"), hl("DiffAdd")
   local green, red = added.fg or 0x2ea043, removed.fg or 0xf85149
-  local add_line = hl("DiffAdd").bg or blend(green, bg, 0.2)
+  local add_line = diff_add.bg or blend(green, bg, 0.2)
   local delete = hl("DiffDelete")
   local del_line = delete.bg or blend(red, bg, 0.2)
   local text_cterm = hl("DiffText").ctermbg
   local groups = {
-    AgentEditsAddLine = { bg = add_line, ctermbg = hl("DiffAdd").ctermbg },
+    AgentEditsAddLine = { bg = add_line, ctermbg = diff_add.ctermbg },
     AgentEditsAddText = { bg = blend(green, add_line, 0.3), ctermbg = text_cterm },
     AgentEditsAddNr = { fg = green, bg = add_line, ctermfg = added.ctermfg },
     AgentEditsDelLine = { bg = del_line, ctermbg = delete.ctermbg, ctermfg = not delete.ctermbg and removed.ctermfg or nil },
@@ -2132,12 +2146,27 @@ local function setup()
   refresh(true)
   vim.api.nvim_set_current_win(M.list_win)
 
-  -- Follow the agent live: reload changed files and pick up newly edited ones.
-  local timer = vim.uv.new_timer()
-  timer:start(2000, 2000, vim.schedule_wrap(function()
-    vim.cmd("silent! checktime")
+  -- Follow the agent live: reload the file shown ('autoread' reloads the
+  -- others when they are shown again) and pick up new edits, every 2
+  -- seconds. While the popup is hidden (tmux sends FocusLost when its client
+  -- detaches), every 30 seconds, enough to notice a closed tmux window;
+  -- FocusGained catches up at once.
+  M.timer = vim.uv.new_timer()
+  local function tick()
+    if vim.api.nvim_win_is_valid(M.code_win) then
+      vim.cmd("silent! checktime " .. vim.api.nvim_win_get_buf(M.code_win))
+    end
     refresh(false)
-  end))
+  end
+  local function every(ms) M.timer:start(ms, ms, vim.schedule_wrap(tick)) end
+  every(2000)
+  vim.api.nvim_create_autocmd("FocusLost", { callback = function() every(30000) end })
+  vim.api.nvim_create_autocmd("FocusGained", {
+    callback = function()
+      tick()
+      every(2000)
+    end,
+  })
 end
 
 vim.api.nvim_create_autocmd("VimEnter", { once = true, nested = true, callback = setup })
