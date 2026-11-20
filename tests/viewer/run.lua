@@ -159,6 +159,7 @@ local function reset()
   -- Unfolded, so the rows show; "everything starts folded" has its own test.
   V().grouped, V().folders, V().folded, V().fold_default = false, true, {}, false
   V().confirm = function() return true end
+  V().inline = true
   -- Outside tmux: every window.
   V().current_tab, V().tab_only = function() return nil end, true
   vim.fn.delete(state .. "/baselines", "rf")
@@ -242,6 +243,8 @@ test("files the session created are marked +", function()
   log({ { 10, "Claude", "made.txt" }, { 20, "Claude", "changed.txt" } })
   has(row_text("made.txt"), "+ Claude", "created row")
   eq(row_text("changed.txt"):find("+", 1, true), nil, "edited row")
+  select("made.txt")
+  eq(V().stats[abs("made.txt")], { add = 2, change = 0, delete = 0 }, "stats")
 end)
 
 test("change markers count added, changed and deleted lines", function()
@@ -548,6 +551,101 @@ test("a closed tmux window ends the viewer", function()
   V().current_tab = function() return nil end
   assert(ok, err)
   eq(quit, true, "quit")
+end)
+
+-- Inline diff ---------------------------------------------------------------------
+
+-- The inline diff in the code window: the virtual lines as { line, "above" /
+-- "below", { "<old number>:<text>", ... } }, the lines on a green background,
+-- and the brighter words as { line, start col, end col }.
+local function inline_marks()
+  local buf = vim.api.nvim_win_get_buf(V().code_win)
+  local ns = vim.api.nvim_get_namespaces()["agent-edits"]
+  local virt, added, words, signs = {}, {}, {}, 0
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+    local row, col, d = m[2] + 1, m[3], m[4]
+    if d.virt_lines then
+      local texts = {}
+      for _, chunks in ipairs(d.virt_lines) do
+        local t = {}
+        for i = 2, #chunks do t[#t + 1] = chunks[i][1] end
+        texts[#texts + 1] = chunks[1][1]:match("(%d+)%s*$") .. ":" .. vim.trim(table.concat(t))
+      end
+      virt[#virt + 1] = { row, d.virt_lines_above and "above" or "below", texts }
+    elseif d.hl_group == "AgentEditsAddLine" then
+      added[#added + 1] = row
+    elseif d.hl_group == "AgentEditsAddText" then
+      words[#words + 1] = { row, col, d.end_col }
+    elseif d.sign_text then
+      signs = signs + 1
+    end
+  end
+  return virt, added, words, signs
+end
+
+-- The closed folds of the code window, as { first, last }.
+local function closed_folds()
+  return vim.api.nvim_win_call(V().code_win, function()
+    local out, l = {}, 1
+    while l <= vim.fn.line("$") do
+      local last = vim.fn.foldclosedend(l)
+      if last > 0 then
+        out[#out + 1] = { l, last }
+        l = last + 1
+      else
+        l = l + 1
+      end
+    end
+    return out
+  end)
+end
+
+test("the inline diff shows the changes like GitHub", function()
+  local old, new = {}, {}
+  for i = 1, 30 do old[i] = "l" .. i end
+  -- l2 changed, l10 deleted, a line added after l20.
+  for i = 1, 30 do
+    if i == 2 then new[#new + 1] = "l2 changed" elseif i ~= 10 then new[#new + 1] = old[i] end
+    if i == 20 then new[#new + 1] = "added" end
+  end
+  baseline("s1", "inline.txt", table.concat(old, "\n") .. "\n")
+  file("inline.txt", table.concat(new, "\n") .. "\n")
+  log({ { 5, "Claude", "inline.txt" } })
+  select("inline.txt")
+  local virt, added, words = inline_marks()
+  eq(virt, { { 2, "above", { "2:l2" } }, { 9, "below", { "10:l10" } } }, "removed lines")
+  eq(added, { 2, 20 }, "added lines")
+  eq(words, { { 2, 2, 10 } }, "changed words")
+  eq(closed_folds(), { { 13, 16 }, { 24, 30 } }, "unchanged lines folded")
+  eq(vim.api.nvim_win_get_cursor(V().code_win)[1], 2, "cursor on the first change")
+
+  keys("I")
+  virt, added, words = inline_marks()
+  local _, _, _, signs = inline_marks()
+  eq({ #virt, #added, #words }, { 0, 0, 0 }, "I: no inline diff")
+  eq(signs, 3, "I: signs")
+  eq(closed_folds(), {}, "I: no folds")
+  keys("I")
+  eq(#inline_marks(), 2, "I again")
+  eq(#closed_folds(), 2, "I again: folds")
+
+  keys("D")
+  eq(#inline_marks(), 0, "D: no inline diff beside the side-by-side one")
+  keys("D")
+  eq(#inline_marks(), 2, "D again")
+end)
+
+test("the inline diff of a deleted file and of a change on line 1", function()
+  baseline("s1", "removed.txt", "a\nb\n")
+  baseline("s1", "first.txt", "one\ntwo\n")
+  file("first.txt", "ONE\ntwo\n")
+  log({ { 5, "Claude", "removed.txt" }, { 10, "Claude", "first.txt" } })
+  select("removed.txt")
+  eq(inline_marks(), { { 1, "above", { "1:a", "2:b" } } }, "deleted file")
+  select("first.txt")
+  eq(inline_marks(), { { 1, "above", { "1:one" } } }, "line 1")
+  -- Lines above the first one only show when the window is told to.
+  eq(vim.api.nvim_win_call(V().code_win, vim.fn.winsaveview).topfill, 1, "topfill")
 end)
 
 -- Revert ------------------------------------------------------------------------
