@@ -7,19 +7,21 @@ the **Claude Code**, **Codex** or **Grok** agents running in that tmux window ed
 window (tab) has its own list: switch windows and you see the files of the agents there. Git is
 not required. The newest
 edits are at the top, grouped by folder. Moving through the list previews each file read-only, and the preview
-follows the agent live while it works. Select lines and press `y` or `d` to paste them into the
-agent's prompt.
+follows the agent live while it works. The preview shows what the agent changed like a GitHub
+diff: added lines in green, removed ones in red with their old line numbers, the changed words
+brighter, and the unchanged stretches folded. Files an agent created are marked `+`. Select
+lines and press `y` or `d` to paste them into the agent's prompt.
 
 ```
-┌ Edits (5)  my-project ─────────────────┬ src/api/routes.ts  (Claude, 2m ago) ───────────────┐
-│ ▾ src/                               3 │  1 import { Router } from "express";               │
-│   ▾ api/                             2 │  2 import { auth } from "./auth";                  │
-│     routes.ts               Claude  2m │  3                                                 │
-│     auth.ts                 Claude$ 5m │  4 export const router = Router();                 │
-│   ▸ components/forms/                1 │  5                                                 │
-│ ▾ tests/                             1 │  6 router.get("/health", (_req, res) => {          │
-│   routes.test.ts             Grok   1h │  7   res.json({ ok: true });                       │
-│ README.md                   Codex   9m │  8 });                                             │
+┌ Edits (5)  my-project ─────────────────┬ src/api/routes.ts  (Claude, 2m ago)  +1 ~1 -0 ─────┐
+│ ▾ src/                               3 │    1   ⋯ 9 unchanged lines                         │
+│   ▾ api/                             2 │   10 import { auth } from "./auth";                │
+│     routes.ts               Claude  2m │   11                                               │
+│     auth.ts                 Claude$ 5m │   12 export const router = Router();               │
+│   ▸ components/forms/                1 │-  13 router.get("/health", (req, res) => {         │
+│ ▾ tests/                             1 │+  13 router.get("/health", (_req, res) => {        │
+│   routes.test.ts           + Grok   1h │+  14   log.debug("health check");                  │
+│ README.md                   Codex   9m │   15   res.json({ ok: true });                     │
 └────────────────────────────────────────┴────────────────────────────────────────────────────┘
 ```
 
@@ -45,7 +47,9 @@ agent's prompt.
    in a window starts its viewer, and later presses re-attach to it, so hiding the popup keeps its
    state. A viewer ends when its window is closed.
 3. `agent-edits-view` starts Neovim with `nvim/viewer.lua` in the pane's directory. Every file
-   edited from one of the window's panes is listed under its folder (`w` lists every window's), and you can filter the list by agent, session or project. A path
+   edited from one of the window's panes is listed under its folder (`w` lists every window's), and you can filter the list by agent, session or project.
+   Agents running outside tmux, such as Claude Code's background agents, count for every
+   window with a pane in their project. A path
    is shown relative to the editing session's project, or to the directory, or as `~/...`.
    The list refreshes every 2 seconds.
 4. The binding also passes the pane's id to the viewer. Selected code is pasted into that pane
@@ -126,9 +130,10 @@ already running in the background, the same key brings it back as you left it.
 | `@` | list | Paste `@path` into the agent's prompt (a file reference for Claude Code and Codex). On a folder it sends the folder. Works on a visual selection of rows too. The viewer stays open. |
 | `]f` / `[f` | anywhere | Next / previous edited file |
 | `Ctrl-h` / `Ctrl-l` | anywhere | Move between the list and the code |
+| `I` | anywhere | Toggle the inline diff (on by default). The code shows what the agent changed since the session's first edit, like a GitHub diff: added and changed lines on a green background, the lines they replaced or that were deleted in red above them, with their old line numbers, and the changed words brighter. Unchanged stretches are folded, but for 3 lines around each change (`zo` / `zR` open them). A file opens at its first change. Off, only the margin marks the changes. |
 | `D` | anywhere | Toggle a side-by-side diff of what the agent changed: the file before the session's first edit, next to the file now |
 | `gD` | anywhere | Toggle a side-by-side diff against `HEAD` |
-| `]c` / `[c` | anywhere | Next / previous change. Changed lines are marked in the margin (`▎` added or changed, `▁` deleted below), and the code winbar shows `+added ~changed -deleted`. |
+| `]c` / `[c` | anywhere | Next / previous change. With `I` off, changed lines are marked in the margin (`▎` added or changed, `▁` deleted below). The code winbar shows `+added ~changed -deleted`. |
 | `o` | anywhere | Open the file in `$VISUAL` / `$EDITOR` (default `nvim`) in a new tmux window next to the agent's. From the code window it opens at the cursor line, from the list at the first change. The popup hides itself. |
 | `O` | anywhere | Same, but in a split next to the agent pane |
 | `R` | code | Revert the change under the cursor to what it was before the agent's session (also in the `D` diff window). Asks first. |
@@ -172,13 +177,20 @@ Your own `~/.config/nvim/init.lua` is loaded first, so you keep your colorscheme
   Inside git, committed files a command deletes (`rm`, `git rm`) are recorded too, with their
   `HEAD` version as the snapshot. Deleting untracked files, or files outside git, is not seen.
 - Only edits made after you install the hook are recorded.
-- Edits logged before the hook recorded the tmux pane, and edits by agents running outside tmux,
-  belong to no window: `w` shows them. An agent moved to another window (`join-pane`) takes its
-  edits along; a tmux server restart starts every window empty.
+- Edits logged before the hook recorded the tmux pane belong to no window: `w` shows them.
+  Agents running outside tmux can't be tied to a pane: Claude Code's background agents, for
+  example, run without the tmux environment. Their edits show up in each window that has a pane
+  in their project (the agent's directory, or a folder inside it or above it, but not `$HOME`
+  or `/`). An agent moved to another window (`join-pane`) takes its edits along; a tmux server
+  restart starts every window empty.
 - `D` falls back to `HEAD` for edits recorded before the snapshots existed and for files over 2 MB.
+- A file is marked `+` (created) when the hook found nothing to snapshot before the session's
+  first edit, so files created by shell commands are not marked (they have no snapshot).
+- The inline diff shows nothing for a file without a snapshot or a committed version (a file a
+  shell command created), or over 2 MB. The removed lines are plain text, without syntax colours.
 - A file that no longer exists stays in the list, struck through and marked `✗`, when there is a
-  snapshot of what it held: `D` shows it. Files an agent created and then removed again
-  (scratch files) are hidden.
+  snapshot of what it held: `D` shows it. A deleted folder is marked the same way. Files an
+  agent created and then removed again (scratch files) are hidden.
 - `:AgentEditsPatch` diffs each file against its snapshot. Paths are relative to the git work
   tree (or the session's directory), so `git apply` and `patch -p1` take it. Files without a
   snapshot are diffed against `HEAD` inside git; binary files, files over 2 MB and shell edits

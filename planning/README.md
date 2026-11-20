@@ -56,6 +56,7 @@ The keys are planned together so that the features don't collide.
 | Key | Where | Action | Task |
 |-----|-------|--------|------|
 | `D` | anywhere | diff against the agent's baseline | 1 |
+| `I` | anywhere | inline diff in the code, like GitHub (toggle, on by default) | inline diff |
 | `gD` | anywhere | diff against `HEAD` (the old `D`) | 1 |
 | `]c` / `[c` | code | next / previous change | 2 |
 | `a` | list | cycle the agent filter: all, Claude, Codex, Grok | 3 |

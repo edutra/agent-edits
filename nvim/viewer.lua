@@ -117,9 +117,12 @@ local function read_log()
     local f = vim.split(line, "\t", { plain = true })
     local ts, path = tonumber(f[1]), f[3]
     if ts and path and path ~= "" then
+      -- outside: the agent ran outside tmux (lines older than the pane
+      -- column don't say).
       local e = {
         ts = ts, agent = f[2], path = path,
         project = f[4] or "", session = f[5] or "-", via = f[6] or "tool", pane = f[7] or "-",
+        outside = f[7] == "-",
       }
       e.rel, e.base = display_name(path, f[4])
       if not c.latest[path] or c.latest[path].ts <= ts then c.latest[path] = e end
@@ -139,6 +142,31 @@ local function baseline_file(e)
   return baselines_dir .. "/" .. e.session .. "/" .. vim.fn.sha256(e.path)
 end
 
+local home = vim.env.HOME
+
+-- "This project": the file is under `dir` (default: the viewer's directory),
+-- or the session that edited it was started in that directory, below it, or
+-- above it (except $HOME and /, which are not projects).
+local function in_project(e, dir)
+  dir = dir or root
+  if under(e.path, dir) then return true end
+  local project = e.project or ""
+  if project == "" then return false end
+  if under(project, dir) then return true end
+  return under(dir, project) and project ~= home and project ~= "/"
+end
+
+-- An edit by an agent running outside tmux, such as a Claude Code background
+-- agent (they run without the tmux environment), belongs to every window
+-- with a pane in its project.
+local function near_tab(e)
+  if not e.outside then return false end
+  for _, dir in ipairs(M.tab.dirs or {}) do
+    if in_project(e, dir) then return true end
+  end
+  return false
+end
+
 -- The logged files to list, newest first, in both shapes (see read_log).
 -- A file that no longer exists stays listed, marked deleted, when there is a
 -- baseline to show what it held: the agent deleted it, or it was deleted
@@ -150,7 +178,8 @@ local function read_entries()
   local log = read_log()
   local latest = log.latest
   local shown, sessions = latest, log.per_session
-  -- One tmux window: only the edits made from its panes.
+  -- One tmux window: only the edits made from its panes, and those of the
+  -- agents outside tmux working in its projects.
   local panes = M.tab_only and M.tab and M.tab.panes
   if panes then
     shown, sessions = {}, {}
@@ -158,7 +187,9 @@ local function read_entries()
       if panes[e.pane] and (not shown[e.path] or shown[e.path].ts < e.ts) then shown[e.path] = e end
     end
     for key, e in pairs(log.per_session) do
-      if panes[e.pane] then sessions[key] = e end
+      local outside = near_tab(e)
+      if outside and (not shown[e.path] or shown[e.path].ts < e.ts) then shown[e.path] = e end
+      if panes[e.pane] or outside then sessions[key] = e end
     end
   end
   -- Reviewed until anyone edits the file again.
@@ -178,6 +209,11 @@ local function read_entries()
         local base = baseline_file(e)
         e.has_baseline = base ~= nil and vim.uv.fs_stat(base) ~= nil
       end
+      -- The session created the file: the hook found nothing to save before it.
+      if e.created == nil then
+        local base = baseline_file(e)
+        e.created = base ~= nil and vim.uv.fs_stat(base .. ".new") ~= nil
+      end
       if not e.deleted or e.has_baseline then out[#out + 1] = e end
     end
     return sort_entries(out)
@@ -188,19 +224,7 @@ end
 -- Filters ------------------------------------------------------------------
 -- a: one agent; s: the session of the selected file; p: this project only.
 
-local home = vim.env.HOME
 M.filters = { agent = nil, session = nil, project = false }
-
--- "This project": the file is under the viewer's directory, or the session
--- that edited it was started in that directory, below it, or above it
--- (except $HOME and /, which are not projects).
-local function in_project(e)
-  if under(e.path, root) then return true end
-  local project = e.project or ""
-  if project == "" then return false end
-  if under(project, root) then return true end
-  return under(root, project) and project ~= home and project ~= "/"
-end
 
 -- Hide committed files (H) ----------------------------------------------------
 -- A file is "committed" when it is in a git repository and git status reports
@@ -392,11 +416,13 @@ local function new_folder(key, label, path)
 end
 
 -- A folder with nothing but one subfolder becomes one row: "src/api/".
+-- deleted: the folder is gone from the disk (its files are all deleted).
 local function compact(f)
   while not f.project and #f.items == 1 and f.items[1].folder do
     local sub = f.items[1].folder
     f.label, f.key, f.path, f.items = f.label .. "/" .. sub.label, sub.key, sub.path, sub.items
   end
+  f.deleted = f.path ~= "" and vim.uv.fs_stat(f.path) == nil
   for _, item in ipairs(f.items) do
     if item.folder then compact(item.folder) end
   end
@@ -534,9 +560,12 @@ local function row_chunks(row)
     for _, e in ipairs(f.files) do
       if not e.reviewed then todo = todo + 1 end
     end
+    local right = { { " " } }
+    if f.deleted then right[#right + 1] = { "✗ ", "Removed", keep = true } end
+    right[#right + 1] = { tostring(#f.files), "AgentEditsMeta" }
     return { indent, { (is_folded(f.key) and "▸" or "▾") .. " ", "AgentEditsFoldMark" },
       { f.label .. "/", f.project and "Title" or "AgentEditsFolder", cut = true } },
-      { { " " .. #f.files, "AgentEditsMeta" } }, todo == 0 and "Comment" or nil
+      right, f.deleted and "AgentEditsDeleted" or (todo == 0 and "Comment" or nil)
   end
   local e = row.entry
   local left = { indent }
@@ -551,7 +580,11 @@ local function row_chunks(row)
   end
   local right = { { " " } }
   if e.reviewed then right[#right + 1] = { "✓ ", "AgentEditsReviewedMark", keep = true } end
-  if e.deleted then right[#right + 1] = { "✗ ", "Removed", keep = true } end
+  if e.deleted then
+    right[#right + 1] = { "✗ ", "Removed", keep = true }
+  elseif e.created then
+    right[#right + 1] = { "+ ", "Added", keep = true }
+  end
   -- In the session view the header names the agent.
   if not M.grouped then right[#right + 1] = { e.agent, agent_hl(e.agent) } end
   right[#right + 1] = { e.via == "shell" and "$" or " ", "AgentEditsMeta" }
@@ -623,8 +656,8 @@ local function inner_option(name)
 end
 
 -- The popup's tmux window: { panes = set of "<server pid>:<pane id>",
--- label }, nil outside the popup, or { gone = true } once the window is
--- closed. Tests replace it.
+-- dirs = the panes' directories (not $HOME or /), label }, nil outside the
+-- popup, or { gone = true } once the window is closed. Tests replace it.
 function M.current_tab()
   if vim.env.AGENT_EDITS_POPUP ~= "1" or not vim.env.TMUX then return nil end
   local socket = inner_option("@ae_socket")
@@ -632,13 +665,16 @@ function M.current_tab()
   if window == "" then window = inner_option("@ae_pane") end
   if socket == "" or window == "" then return nil end
   local out = vim.fn.systemlist({ "tmux", "-S", socket, "list-panes", "-t", window,
-    "-F", "#{pid} #{pane_id} #{window_index} #{window_name}" })
+    "-F", "#{pid}\t#{pane_id}\t#{window_index}\t#{pane_current_path}\t#{window_name}" })
   if vim.v.shell_error ~= 0 then return { gone = true } end
-  local tab = { panes = {} }
+  local tab = { panes = {}, dirs = {} }
   for _, l in ipairs(out) do
-    local pid, pane, index, name = l:match("^(%d+) (%%%d+) (%d+) ?(.*)$")
+    local pid, pane, index, dir, name = l:match("^(%d+)\t(%%%d+)\t(%d+)\t([^\t]*)\t?(.*)$")
     if pid then
       tab.panes[pid .. ":" .. pane] = true
+      if dir ~= "" and dir ~= home and dir ~= "/" and not vim.tbl_contains(tab.dirs, dir) then
+        tab.dirs[#tab.dirs + 1] = dir
+      end
       -- Agents set long window titles: keep the start.
       if vim.fn.strchars(name) > 16 then name = vim.fn.strcharpart(name, 0, 15) .. "…" end
       tab.label = tab.label or ("window " .. index .. (name ~= "" and (" " .. name) or ""))
@@ -683,7 +719,8 @@ local function refresh(force)
   end
   local entries = apply_filters(all)
   M.total, M.all = #all, all
-  local sig = { git_sig, M.reviewed_raw, M.tab_only and M.tab and M.tab.label or "" }
+  local tab = M.tab_only and M.tab
+  local sig = { git_sig, M.reviewed_raw, tab and (tab.label .. "\0" .. table.concat(tab.dirs or {}, "\0")) or "" }
   for _, e in ipairs(per_session) do
     sig[#sig + 1] = e.ts .. e.session .. e.path .. (e.deleted and "\tdeleted" or "")
   end
@@ -884,13 +921,212 @@ local function base_for(e, kind)
 end
 
 -- Change markers ----------------------------------------------------------
--- Signs on the lines that differ from the agent's starting point (or HEAD),
--- and ]c / [c to jump between those changes without opening the diff.
+-- What the agent changed since its starting point (or HEAD), shown in the
+-- code like a GitHub diff: added and changed lines on a green background,
+-- the lines they replaced or that were deleted in red above them (virtual
+-- lines, with their old numbers), the changed words brighter, and the
+-- unchanged stretches folded but for CONTEXT lines around each change.
+-- I turns that off and leaves signs in the margin. ]c / [c jump between the
+-- changes either way.
 
 local ns = vim.api.nvim_create_namespace("agent-edits")
 local MAX_DIFF_BYTES = 2000000
+local CONTEXT, MIN_FOLD = 3, 4
 local diff_fn = (vim.text and vim.text.diff) or vim.diff
-M.hunks, M.stats = {}, {}
+M.hunks, M.stats, M.inline = {}, {}, true
+
+-- Words, runs of blanks and single other characters, as { first, last, text }.
+local function tokens(s)
+  local out, i = {}, 1
+  while i <= #s do
+    local _, j = s:find("^[%w_\128-\255]+", i)
+    if not j then _, j = s:find("^%s+", i) end
+    j = j or i
+    out[#out + 1] = { i, j, s:sub(i, j) }
+    i = j + 1
+  end
+  return out
+end
+
+-- The byte ranges ({ first, last }) where `old` and `new` differ, word by
+-- word. Nil when the lines have no word in common: all of it changed, and
+-- brighter words would only add noise.
+local function word_diff(old, new)
+  if old == "" or new == "" or #old > 1000 or #new > 1000 then return nil end
+  local a, b = tokens(old), tokens(new)
+  local function text(t)
+    local out = {}
+    for i, tk in ipairs(t) do out[i] = tk[3] end
+    return table.concat(out, "\n") .. "\n"
+  end
+  local ok, hunks = pcall(diff_fn, text(a), text(b), { result_type = "indices" })
+  if not ok or type(hunks) ~= "table" or #hunks == 0 then return nil end
+  local ranges_a, ranges_b, changed = {}, {}, {}
+  for _, h in ipairs(hunks) do
+    local start_a, count_a, start_b, count_b = unpack(h)
+    if count_a > 0 then
+      ranges_a[#ranges_a + 1] = { a[start_a][1], a[start_a + count_a - 1][2] }
+      for i = start_a, start_a + count_a - 1 do changed[i] = true end
+    end
+    if count_b > 0 then ranges_b[#ranges_b + 1] = { b[start_b][1], b[start_b + count_b - 1][2] } end
+  end
+  for i, tk in ipairs(a) do
+    if not changed[i] and tk[3]:find("%S") then return ranges_a, ranges_b end
+  end
+  return nil
+end
+
+-- Virtual text chunks of an old line: tabs expanded to `ts`, the byte
+-- `ranges` in `word_hl` and the rest in `hl`, padded to `width` cells so the
+-- background covers the window.
+local function old_chunks(line, ranges, hl, word_hl, ts, width)
+  local chunks, col = {}, 0
+  local function add(s, group)
+    local parts = {}
+    for piece, tab in s:gmatch("([^\t]*)(\t?)") do
+      parts[#parts + 1] = piece
+      col = col + vim.api.nvim_strwidth(piece)
+      if tab ~= "" then
+        parts[#parts + 1] = string.rep(" ", ts - col % ts)
+        col = col + ts - col % ts
+      end
+    end
+    local text = table.concat(parts)
+    if text ~= "" then chunks[#chunks + 1] = { text, group } end
+  end
+  local pos = 1
+  for _, r in ipairs(ranges or {}) do
+    add(line:sub(pos, r[1] - 1), hl)
+    add(line:sub(r[1], r[2]), word_hl)
+    pos = r[2] + 1
+  end
+  add(line:sub(pos), hl)
+  chunks[#chunks + 1] = { string.rep(" ", math.max(width - col, 0)), hl }
+  return chunks
+end
+
+-- Draws the changes of `e` in `buf`: the inline diff, or signs. Fills
+-- M.hunks and M.stats, and returns the unchanged stretches to fold.
+local function draw_changes(e, buf, inline)
+  local base = base_for(e, "agent")
+  if not base then return {} end
+  -- A deleted file's buffer still has one empty line: compare with nothing.
+  local lines = e.deleted and {} or vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local old = #base == 0 and "" or (table.concat(base, "\n") .. "\n")
+  local new = #lines == 0 and "" or (table.concat(lines, "\n") .. "\n")
+  if #old > MAX_DIFF_BYTES or #new > MAX_DIFF_BYTES then return {} end
+  local ok, hunks = pcall(diff_fn, old, new, { result_type = "indices" })
+  if not ok or type(hunks) ~= "table" then return {} end
+
+  local last = vim.api.nvim_buf_line_count(buf)
+  local function mark(line, col, opts)
+    line = math.max(1, math.min(line, last))
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns, line - 1, col, opts)
+  end
+  -- The margin of a virtual line: "-" in the sign column, the old line
+  -- number in the number column.
+  local wo = vim.wo[M.code_win]
+  local numw = (wo.number or wo.relativenumber) and math.max(wo.numberwidth, #tostring(last) + 1) or 0
+  local margin = string.rep(" ", tonumber(wo.foldcolumn) or 0) .. "- "
+  local ts, width = vim.bo[buf].tabstop, vim.o.columns
+  local st, starts, spans = M.stats[e.path], M.hunks[e.path], {}
+  -- Virtual lines above the first line: the window has to be told to show them.
+  local top = 0
+  for _, h in ipairs(hunks) do
+    local start_a, count_a, start_b, count_b = unpack(h)
+    if count_b == 0 then
+      -- Deleted lines: they were after line start_b.
+      st.delete = st.delete + count_a
+      starts[#starts + 1] = math.max(start_b, 1)
+      spans[#spans + 1] = { math.max(start_b, 1), math.max(start_b, 1) }
+    else
+      local kind = count_a > 0 and "change" or "add"
+      st[kind] = st[kind] + count_b
+      starts[#starts + 1] = start_b
+      spans[#spans + 1] = { start_b, start_b + count_b - 1 }
+    end
+    if not inline then
+      if count_b == 0 then
+        mark(start_b == 0 and 1 or start_b, 0,
+          { sign_text = start_b == 0 and "▔" or "▁", sign_hl_group = "Removed", priority = 20 })
+      else
+        local hl = count_a > 0 and "Changed" or "Added"
+        for l = start_b, start_b + count_b - 1 do mark(l, 0, { sign_text = "▎", sign_hl_group = hl, priority = 20 }) end
+      end
+    else
+      -- Old and new lines side by side in a change get their words compared.
+      local words_a, words_b = {}, {}
+      for k = 0, math.min(count_a, count_b) - 1 do
+        words_a[k], words_b[k] = word_diff(base[start_a + k], lines[start_b + k])
+      end
+      if count_a > 0 then
+        local virt = {}
+        for k = 0, count_a - 1 do
+          local number = numw > 0 and string.format("%" .. (numw - 1) .. "d ", start_a + k) or ""
+          local chunks = { { margin .. number, "AgentEditsDelNr" } }
+          virt[k + 1] = vim.list_extend(chunks,
+            old_chunks(base[start_a + k], words_a[k], "AgentEditsDelLine", "AgentEditsDelText", ts, width))
+        end
+        -- Above the lines that replaced them, else below the line they followed.
+        local above = count_b > 0 or start_b == 0
+        mark(math.max(start_b, 1), 0, { virt_lines = virt, virt_lines_above = above, virt_lines_leftcol = true })
+        if above and start_b <= 1 then top = count_a end
+      end
+      for k = 0, count_b - 1 do
+        local l = start_b + k
+        -- The background as a range to the next line: line_hl_group would
+        -- cover the brighter words. The sign on its own, or it would show
+        -- on the next line too.
+        mark(l, 0, { end_row = l, end_col = 0, strict = false, hl_eol = true, hl_group = "AgentEditsAddLine", priority = 20 })
+        mark(l, 0, { number_hl_group = "AgentEditsAddNr", sign_text = "+", sign_hl_group = "AgentEditsAddNr", priority = 20 })
+        for _, r in ipairs(words_b[k] or {}) do
+          mark(l, r[1] - 1, { end_col = r[2], hl_group = "AgentEditsAddText", priority = 21 })
+        end
+      end
+    end
+  end
+
+  local folds, shown = {}, 0
+  for _, span in ipairs(spans) do
+    local from, to = shown == 0 and 1 or shown + CONTEXT + 1, span[1] - CONTEXT - 1
+    if to - from + 1 >= MIN_FOLD then folds[#folds + 1] = { from, to } end
+    shown = math.max(shown, span[2])
+  end
+  if shown > 0 and last - shown - CONTEXT >= MIN_FOLD then folds[#folds + 1] = { shown + CONTEXT + 1, last } end
+  return folds, top
+end
+
+function M.fold_text()
+  return string.format("  ⋯ %d unchanged lines", vim.v.foldend - vim.v.foldstart + 1)
+end
+
+-- Folds the unchanged stretches in `win` (nil: removes the folds). With
+-- `first`, the cursor goes to that line (the first change) unless it was
+-- moved from the top already; otherwise its line stays unfolded.
+local function set_folds(win, folds, first)
+  vim.api.nvim_win_call(win, function()
+    local wo = vim.wo[win]
+    if folds then
+      local fill = vim.o.fillchars:gsub("fold:[^,]*,?", ""):gsub(",$", "")
+      wo.fillchars = (fill ~= "" and fill .. "," or "") .. "fold: "
+      wo.foldtext = "v:lua.require'agent-edits'.fold_text()"
+      wo.foldmethod = "manual"
+    end
+    vim.cmd("silent! normal! zE")
+    M.folds_set = folds ~= nil
+    if not folds then
+      wo.foldtext = vim.go.foldtext
+      return
+    end
+    for _, f in ipairs(folds) do vim.cmd(string.format("silent! %d,%dfold", f[1], f[2])) end
+    wo.foldenable, wo.foldlevel = true, 0
+    if first and vim.api.nvim_win_get_cursor(win)[1] == 1 then
+      pcall(vim.api.nvim_win_set_cursor, win, { first, 0 })
+    else
+      vim.cmd("silent! normal! zv")
+    end
+  end)
+end
 
 function M.update_markers(e)
   if not (e and vim.api.nvim_win_is_valid(M.code_win)) then return end
@@ -899,38 +1135,31 @@ function M.update_markers(e)
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   vim.wo[M.code_win].signcolumn = "yes:1"
   M.hunks[e.path], M.stats[e.path] = {}, { add = 0, change = 0, delete = 0 }
-
-  local base = base_for(e, "agent")
-  if not base then return end
-  local old = table.concat(base, "\n") .. "\n"
-  -- A deleted file's buffer still has one empty line: compare with nothing.
-  local new = e.deleted and "" or (table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") .. "\n")
-  if #old > MAX_DIFF_BYTES or #new > MAX_DIFF_BYTES then return end
-  local ok, hunks = pcall(diff_fn, old, new, { result_type = "indices" })
-  if not ok or type(hunks) ~= "table" then return end
-
-  local last = vim.api.nvim_buf_line_count(buf)
-  local function sign(line, text, hl)
-    line = math.max(1, math.min(line, last))
-    pcall(vim.api.nvim_buf_set_extmark, buf, ns, line - 1, 0,
-      { sign_text = text, sign_hl_group = hl, priority = 20 })
+  -- The side-by-side diff (D) has colours and folds of its own.
+  local inline = M.inline and not M.diff_win
+  local folds, top = draw_changes(e, buf, inline)
+  -- A file shown for the first time opens at its first change.
+  local key = e.path .. "\0" .. e.session
+  local first = M.marked ~= key and M.hunks[e.path][1] or nil
+  M.marked = key
+  if not M.diff_win and (inline or M.folds_set) then
+    set_folds(M.code_win, inline and folds or nil, first)
   end
-  local st = M.stats[e.path]
-  for _, h in ipairs(hunks) do
-    local _, count_a, start_b, count_b = unpack(h)
-    if count_b == 0 then
-      -- Deleted lines: mark the line after which they were.
-      st.delete = st.delete + count_a
-      sign(start_b == 0 and 1 or start_b, start_b == 0 and "▔" or "▁", "Removed")
-      table.insert(M.hunks[e.path], math.max(start_b, 1))
-    else
-      local kind, hl = "add", "Added"
-      if count_a > 0 then kind, hl = "change", "Changed" end
-      st[kind] = st[kind] + count_b
-      for l = start_b, start_b + count_b - 1 do sign(l, "▎", hl) end
-      table.insert(M.hunks[e.path], start_b)
-    end
+  if inline and (top or 0) > 0 then
+    vim.api.nvim_win_call(M.code_win, function()
+      local view = vim.fn.winsaveview()
+      if view.topline == 1 then
+        view.topfill = top
+        vim.fn.winrestview(view)
+      end
+    end)
   end
+end
+
+-- I: the inline diff, or only signs in the margin.
+local function toggle_inline()
+  M.inline = not M.inline
+  M.update_markers(selected())
 end
 
 -- Jump to the next (dir 1) or previous (dir -1) change in the code window.
@@ -969,7 +1198,10 @@ local function toggle_diff(kind)
   if M.diff_win then
     local same = M.diff_kind == kind
     diff_off()
-    if same then return end
+    if same then
+      M.update_markers(e)
+      return
+    end
   end
   local out, label = base_for(e, kind)
   if not out then
@@ -991,6 +1223,7 @@ local function toggle_diff(kind)
   vim.wo[M.diff_win].winbar = " %#Comment#" .. label:gsub("%%", "%%%%")
   vim.cmd("diffthis")
   vim.api.nvim_set_current_win(M.code_win)
+  M.update_markers(e)
 end
 
 -- Revert ------------------------------------------------------------------------
@@ -1642,9 +1875,13 @@ local HELP = {
   " Anywhere",
   "   ]f / [f           next / previous edited file",
   "   Ctrl-h / Ctrl-l   move between list and code",
-  "   D                 diff: what the agent changed (toggle)",
+  "   I                 what the agent changed, inline in the code like a",
+  "                     GitHub diff (toggle, on by default): added lines in",
+  "                     green, removed ones in red, unchanged ones folded",
+  "                     (zo / zR open them); off, only signs in the margin",
+  "   D                 diff: what the agent changed, side by side (toggle)",
   "   gD                diff against HEAD (toggle)",
-  "   ]c / [c           next / previous change (signs in the margin)",
+  "   ]c / [c           next / previous change",
   "   o                 open in $EDITOR, new tmux window, at this line",
   "   O                 same, in a split next to the agent",
   "   R                 revert to before the agent's session: in the code,",
@@ -1670,7 +1907,9 @@ local HELP = {
   "",
   " Claude$ (a $ after the agent): the edit was inferred from a shell",
   " command; files changed meanwhile by something else may show up too.",
+  " + (green): the agent's session created the file.",
   " ✗ (struck through): the file was deleted; D shows what it held.",
+  " On a folder: the folder was deleted, with every file in it.",
   "",
   " All other Vim motions work as usual; buffers are read-only.",
   " Close this help with q or Esc.",
@@ -1698,6 +1937,16 @@ local function show_help()
   end
 end
 
+-- `fg` over `bg` (0xRRGGBB) at opacity `alpha`.
+local function blend(fg, bg, alpha)
+  local out = 0
+  for _, unit in ipairs({ 65536, 256, 1 }) do
+    local f, b = math.floor(fg / unit) % 256, math.floor(bg / unit) % 256
+    out = out + math.floor(b + (f - b) * alpha + 0.5) * unit
+  end
+  return out
+end
+
 -- The list's colours, linked to standard groups so they follow the
 -- colorscheme. Deleted files: struck through, in the colour of removed lines.
 local function set_highlights()
@@ -1709,6 +1958,31 @@ local function set_highlights()
     AgentEditsMeta = "Comment", AgentEditsReviewedMark = "DiagnosticOk",
   }
   for name, to in pairs(links) do vim.api.nvim_set_hl(0, name, { link = to, default = true }) end
+
+  -- The inline diff: the colorscheme's diff backgrounds for whole lines (or
+  -- its added / removed colour over the background), stronger for the
+  -- changed words, and the margin in the added / removed colour.
+  local function hl(name) return vim.api.nvim_get_hl(0, { name = name, link = false }) end
+  local normal = hl("Normal")
+  local bg = normal.bg or (vim.o.background == "light" and 0xffffff or 0x000000)
+  local added = hl("Added")
+  local green, red = added.fg or 0x2ea043, removed.fg or 0xf85149
+  local add_line = hl("DiffAdd").bg or blend(green, bg, 0.2)
+  local delete = hl("DiffDelete")
+  local del_line = delete.bg or blend(red, bg, 0.2)
+  local text_cterm = hl("DiffText").ctermbg
+  local groups = {
+    AgentEditsAddLine = { bg = add_line, ctermbg = hl("DiffAdd").ctermbg },
+    AgentEditsAddText = { bg = blend(green, add_line, 0.3), ctermbg = text_cterm },
+    AgentEditsAddNr = { fg = green, bg = add_line, ctermfg = added.ctermfg },
+    AgentEditsDelLine = { bg = del_line, ctermbg = delete.ctermbg, ctermfg = not delete.ctermbg and removed.ctermfg or nil },
+    AgentEditsDelText = { bg = blend(red, del_line, 0.3), ctermbg = text_cterm },
+    AgentEditsDelNr = { fg = red, bg = del_line, ctermfg = removed.ctermfg },
+  }
+  for name, spec in pairs(groups) do
+    spec.default = true
+    vim.api.nvim_set_hl(0, name, spec)
+  end
 end
 
 -- 30% of the screen, between 40 and 60 columns.
@@ -1774,6 +2048,7 @@ local function setup()
   map("]f", function() move(1) end)
   map("[f", function() move(-1) end)
   map("D", function() toggle_diff("agent") end)
+  map("I", toggle_inline)
   map("gD", function() toggle_diff("head") end)
   map("o", function() open_in_editor(false) end)
   map("O", function() open_in_editor(true) end)
@@ -1836,6 +2111,7 @@ local function setup()
         vim.schedule(function()
           if vim.api.nvim_win_is_valid(M.code_win) then
             vim.api.nvim_win_call(M.code_win, function() vim.cmd("diffoff") end)
+            M.update_markers(selected())
           end
         end)
       elseif win == M.list_win or win == M.code_win then
